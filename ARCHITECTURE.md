@@ -132,15 +132,24 @@ The general principle: **never let a non-critical stage block the pipeline**. Lo
 
 ## 6. What's built vs. planned
 
-This is a living section — update it as the implementation progresses. As of this document's creation, the repo scaffold exists but pipeline stages are stubs pending hackathon implementation. Track actual status in `backend/app/pipeline/` docstrings and update this table alongside code changes.
+This is a living section — update it as the implementation progresses. Track actual status in `backend/app/pipeline/` docstrings and update this table alongside code changes.
 
 | Component | Status |
 |---|---|
 | Repo scaffold, docs | Done |
-| STT integration (AssemblyAI) | Planned |
-| Register detector (LLM + prompt) | Planned |
-| Translator (LLM, register-aware) | Planned |
-| TTS integration (ElevenLabs) | Planned |
-| Voice cloning flow | Planned |
-| Frontend (waveform, live transcript, tone tags) | Planned |
-| Latency instrumentation/dashboard | Planned |
+| `StyleMetadata` schema | Done — see `backend/app/schemas/style_metadata.py` |
+| Register detector (LLM + prompt + few-shots, fallback logic) | Done — real prompt, JSON parsing, confidence-threshold fallback. Not yet validated against a live LLM's actual output quality. |
+| Translator (LLM, register-aware, retry + literal fallback) | Done — real prompt, retry-then-literal-fallback chain implemented and tested. Not yet validated against a live LLM. |
+| TTS style mapping (`StyleMetadata` → ElevenLabs voice settings) | Done — pure mapping function, unit tested. |
+| STT integration (AssemblyAI realtime) | **Stub** — `AssemblyAISTT.stream()` still raises `NotImplementedError`; this is the one stage that needs a real websocket integration against AssemblyAI's API |
+| ElevenLabs API integration | Partially wired — `ElevenLabsTTS.synthesize()`/`clone_voice()` call the real SDK shape, but untested against a live API key |
+| Fallback TTS (OpenAI) | Partially wired — same caveat as above; Cartesia branch not implemented |
+| Orchestrator concurrency (speculative register detection on partials) | Done — see `backend/app/pipeline/orchestrator.py`; tested against fakes in `tests/integration/test_orchestrator_flow.py` |
+| LLM provider adapters (OpenAI, Anthropic) | Done for OpenAI and Anthropic — see `backend/app/ws/session.py::_build_llm_client()`. Groq and Google not yet implemented. |
+| Voice cloning consent flow | **Not implemented** — see `CONTRIBUTING.md` "Known gaps"; do not wire into a live demo without one |
+| Frontend (waveform, live transcript, tone tags) | UI shell only — components render but aren't wired to the WebSocket client yet |
+| Test suite (unit + integration, against fakes) | Done — 40 tests passing, see `TESTING.md` |
+| Live/integration tests against real provider APIs | Planned — see `tests/live/` scaffold in `TESTING.md` |
+| Latency benchmarking against live APIs | Planned — see `TESTING.md` "Latency benchmarking" |
+
+**What an agent picking this up next should prioritize:** the AssemblyAI realtime STT integration is the single biggest remaining gap — every other stage has a real (if unvalidated-against-live-APIs) implementation and test coverage, but `stt.py` is still a stub, which means the pipeline cannot actually run end-to-end yet even though `orchestrator.py`, `register_detector.py`, `translator.py`, and `tts.py` are ready to be exercised by a real STT stream.

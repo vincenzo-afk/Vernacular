@@ -96,22 +96,30 @@ vernacular/
 ├── README.md              ← you are here
 ├── CLAUDE.md               ← instructions for Claude Code / AI coding agents
 ├── AGENTS.md                ← instructions for any AI agent working on this repo
-├── ARCHITECTURE.md          ← system design, data flow, module contracts
+├── ARCHITECTURE.md          ← system design, data flow, module contracts, build status
+├── CONTRIBUTING.md          ← workflow conventions for changes (human or agent)
+├── TESTING.md                ← testing strategy: fakes vs. live tests, what to cover
 ├── backend/
 │   ├── app/
 │   │   ├── main.py                    # FastAPI app entrypoint
 │   │   ├── pipeline/
-│   │   │   ├── stt.py                 # AssemblyAI Realtime STT client
-│   │   │   ├── register_detector.py   # LLM-based register/style detection
-│   │   │   ├── translator.py          # LLM translation + register mapping
-│   │   │   ├── tts.py                 # ElevenLabs TTS client
-│   │   │   └── orchestrator.py        # Ties the pipeline stages together
+│   │   │   ├── AGENTS.md              # stricter, scoped rules for this directory
+│   │   │   ├── stt.py                 # AssemblyAI Realtime STT client (stub)
+│   │   │   ├── register_detector.py   # LLM-based register/style detection (implemented)
+│   │   │   ├── translator.py          # LLM translation + register mapping (implemented)
+│   │   │   ├── tts.py                 # ElevenLabs TTS client + style mapping (implemented)
+│   │   │   └── orchestrator.py        # Ties the pipeline stages together (implemented)
 │   │   ├── schemas/
 │   │   │   └── style_metadata.py      # StyleMetadata pydantic model
 │   │   ├── ws/
-│   │   │   └── session.py             # WebSocket session handling
+│   │   │   └── session.py             # WebSocket session handling + LLM provider adapters
 │   │   └── config.py                  # Settings / env var loading
 │   ├── tests/
+│   │   ├── fakes/                     # FakeSTT, FakeLLMClient, FakeTTS — no network calls
+│   │   ├── unit/                      # per-stage tests against fakes
+│   │   ├── integration/               # full orchestrator flow against fakes
+│   │   └── live/                      # opt-in, real API keys required, skipped by default
+│   ├── pytest.ini
 │   ├── requirements.txt
 │   └── .env.example
 ├── frontend/
@@ -129,6 +137,8 @@ vernacular/
 └── docs/
     └── style-metadata-schema.md      # Full schema reference + examples
 ```
+
+See `ARCHITECTURE.md` §6 for exactly what's implemented vs. stubbed as of the latest change — in short: the register detector, translator, TTS style mapping, and orchestrator concurrency are real, tested implementations; the AssemblyAI STT integration is the main remaining stub.
 
 ---
 
@@ -160,6 +170,16 @@ npm run dev
 ```
 
 Open `http://localhost:3000`, grant mic access, pick a target language, and speak.
+
+### Running the test suite
+
+```bash
+cd backend
+pip install -r requirements.txt
+PYTHONPATH=. pytest tests/unit tests/integration
+```
+
+This runs entirely offline against fakes — no API keys required (see [TESTING.md](./TESTING.md)). Live-API tests are opt-in and separate.
 
 ---
 
