@@ -4,6 +4,10 @@ Instructions for Claude (via Claude Code or any Claude-based agent) working in t
 
 Read [README.md](./README.md) and [ARCHITECTURE.md](./ARCHITECTURE.md) first if you haven't already — this file assumes you know what Vernacular is and how the pipeline is structured. This file is about *how to work in this codebase*, not what it does.
 
+If you're about to edit anything in `backend/app/pipeline/`, also read `backend/app/pipeline/AGENTS.md` — it has stricter, more specific rules for that directory (concurrency model, exact per-stage failure-handling contract) than what's summarized here. For process conventions (how to structure a change) see `CONTRIBUTING.md`; for what to test and how, see `TESTING.md`.
+
+Check `ARCHITECTURE.md` §6 before assuming a module is a stub or a real implementation — as of the last update, `register_detector.py`, `translator.py`, the TTS style-mapping logic, and `orchestrator.py` are real, tested implementations; `stt.py` (AssemblyAI integration) is still a stub and is the main remaining gap.
+
 ---
 
 ## Project in one paragraph

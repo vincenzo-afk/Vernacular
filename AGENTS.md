@@ -25,9 +25,12 @@ The pipeline: **audio in → speech-to-text (AssemblyAI) → register detection 
 | If you need to know... | Read |
 |---|---|
 | What the product does and why | `README.md` |
-| How data flows between stages, the latency budget, fallback behavior | `ARCHITECTURE.md` |
+| How data flows between stages, the latency budget, fallback behavior, what's actually implemented vs. stubbed | `ARCHITECTURE.md` (§6 has current build status) |
 | The exact fields in the style metadata contract | `docs/style-metadata-schema.md` and `backend/app/schemas/style_metadata.py` |
 | Claude-specific coding conventions for this repo | `CLAUDE.md` |
+| Stricter rules specific to the pipeline hot path | `backend/app/pipeline/AGENTS.md` — read this before touching any file in that directory |
+| Process/workflow conventions for making a change | `CONTRIBUTING.md` |
+| What to test and how (fakes vs. live) | `TESTING.md` |
 
 ---
 
