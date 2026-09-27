@@ -17,6 +17,7 @@ import json
 import logging
 from dataclasses import dataclass
 
+from app.pipeline.llm_response_utils import strip_markdown_fence
 from app.schemas.style_metadata import StyleMetadata
 
 logger = logging.getLogger("vernacular.translator")
@@ -128,10 +129,9 @@ class Translator:
                 timeout=RETRY_TIMEOUT_S,
             )
         except Exception:
-            logger.error(
+            logger.exception(
                 "translator: retry also failed, falling back to literal "
-                "translation",
-                exc_info=True,
+                "translation"
             )
             return await self._literal_fallback(
                 source_text, source_style, target_language
@@ -175,15 +175,14 @@ class Translator:
                 timeout=RETRY_TIMEOUT_S,
             )
             return TranslationResult(
-                translated_text=raw.strip(),
+                translated_text=strip_markdown_fence(raw),
                 style=StyleMetadata.neutral_fallback(),
                 was_literal_fallback=True,
             )
         except Exception:
-            logger.error(
+            logger.exception(
                 "translator: literal fallback also failed — returning "
-                "source text untranslated as last resort",
-                exc_info=True,
+                "source text untranslated as last resort"
             )
             return TranslationResult(
                 translated_text=source_text,
@@ -193,13 +192,7 @@ class Translator:
 
     @staticmethod
     def _parse_response(raw: str) -> TranslationResult:
-        text = raw.strip()
-        if text.startswith("```"):
-            text = text.strip("`")
-            if text.lower().startswith("json"):
-                text = text[4:]
-            text = text.strip()
-
+        text = strip_markdown_fence(raw)
         data = json.loads(text)
         return TranslationResult(
             translated_text=data["translated_text"],
