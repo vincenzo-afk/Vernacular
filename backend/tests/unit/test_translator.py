@@ -122,6 +122,65 @@ async def test_falls_back_to_source_text_if_literal_fallback_also_fails():
 
 
 @pytest.mark.asyncio
+async def test_malformed_json_on_first_attempt_triggers_retry_not_silent_failure():
+    """
+    _parse_response raising on unparseable output must be caught by
+    the same broad except in translate() that handles outright LLM
+    exceptions -- a malformed (but non-exception-raising-at-the-
+    network-level) response should still trigger the retry path, not
+    propagate past translate() uncaught.
+    """
+    llm = FakeLLMClient(
+        [
+            ScriptedResponse(content="not valid json at all"),
+            ScriptedResponse(content=GOOD_RESPONSE),
+        ]
+    )
+    translator = Translator(llm_client=llm)
+
+    result = await translator.translate(
+        source_text="Oh, great, another meeting.",
+        source_style=_sarcastic_style(),
+        target_language="es",
+    )
+
+    assert result.translated_text == "Ay, qué bien, otra reunión."
+    assert result.was_literal_fallback is False
+    assert len(llm.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_literal_fallback_strips_markdown_fences_from_response():
+    """
+    The fallback prompt asks for plain text, but since it's the same
+    underlying model, it may still wrap output in a code fence -- the
+    literal fallback path should not include the fence markers in the
+    final translated_text.
+    """
+    llm = FakeLLMClient(
+        [
+            ScriptedResponse(content="", should_raise=True),
+            ScriptedResponse(content="", should_raise=True),
+            ScriptedResponse(content="```\nHola, otra reunión.\n```"),
+        ]
+    )
+    translator = Translator(llm_client=llm)
+
+    result = await translator.translate(
+        source_text="Oh, great, another meeting.",
+        source_style=_sarcastic_style(),
+        target_language="es",
+    )
+
+    assert result.was_literal_fallback is True
+    # As currently implemented, _literal_fallback only .strip()s
+    # whitespace -- it does NOT strip markdown fences the way
+    # _parse_response does for the main JSON path. This test documents
+    # that gap explicitly (see the fix applied alongside this test).
+    assert "```" not in result.translated_text
+
+
+@pytest.mark.asyncio
 async def test_empty_source_text_short_circuits_without_calling_llm():
     llm = FakeLLMClient([])
     translator = Translator(llm_client=llm)
