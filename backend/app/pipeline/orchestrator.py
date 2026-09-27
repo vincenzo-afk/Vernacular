@@ -21,7 +21,7 @@ import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from app.pipeline.register_detector import RegisterDetector
 from app.pipeline.stt import STTProvider, TranscriptEvent
@@ -75,14 +75,6 @@ class SessionOrchestrator:
         self._target_language = target_language
         self._voice_id = voice_id
         self.timings: list[StageTiming] = []
-
-        # Track the most recent speculative register reading per
-        # in-flight segment so the final-transcript pass can reuse it
-        # as a starting point rather than recomputing from scratch.
-        # Keyed by a simple monotonically increasing segment counter
-        # since AssemblyAI doesn't expose a stable per-utterance ID in
-        # the current STTProvider interface.
-        self._speculative_style: dict[int, StyleMetadata] = {}
         self._segment_counter = 0
 
     async def run(
@@ -92,15 +84,20 @@ class SessionOrchestrator:
         Consumes source audio, yields one SegmentOutput per completed
         utterance. See module docstring for the concurrency model.
 
-        Design: STT partials feed a background task that keeps
-        `_speculative_style` warm via register detection, running
-        concurrently with STT's own work of reaching a final
-        transcript. When a final transcript arrives, we do a cheap
-        confirmation pass (or reuse the speculative reading directly
-        if nothing material has changed) rather than blocking on a
-        cold register-detection call.
+        Design: each STT partial launches a speculative register-
+        detection task running concurrently with STT's own work of
+        reaching a final transcript. When a final transcript arrives,
+        we reuse that speculative result if it's still valid (see
+        _resolve_style_for_final) rather than blocking on a cold
+        register-detection call.
         """
+        # Tracks the in-flight speculative register-detection task
+        # together with the exact partial-transcript text it was
+        # launched against, so _resolve_style_for_final can actually
+        # verify the "is this still valid" heuristic described below
+        # instead of blindly trusting whatever finished first.
         speculative_task: asyncio.Task | None = None
+        speculative_source_text: str = ""
 
         async for event in self._stt.stream(audio_chunks):
             if not event.is_final:
@@ -112,50 +109,90 @@ class SessionOrchestrator:
                 speculative_task = asyncio.create_task(
                     self._run_register_detection(event)
                 )
+                speculative_source_text = event.text
                 continue
 
             # Final transcript for this segment has arrived.
             segment_id = self._next_segment_id()
-            style = await self._resolve_style_for_final(event, speculative_task)
+            style = await self._resolve_style_for_final(
+                event, speculative_task, speculative_source_text
+            )
             speculative_task = None
+            speculative_source_text = ""
 
             try:
                 output = await self._process_segment(segment_id, event, style)
             except Exception:
-                logger.error(
+                logger.exception(
                     "orchestrator: segment %s failed end-to-end, skipping "
                     "rather than killing the session",
                     segment_id,
-                    exc_info=True,
                 )
                 continue
 
             yield output
 
     async def _resolve_style_for_final(
-        self, event: TranscriptEvent, speculative_task: asyncio.Task | None
+        self,
+        event: TranscriptEvent,
+        speculative_task: asyncio.Task | None,
+        speculative_source_text: str,
     ) -> StyleMetadata:
         """
         Prefers the speculative reading from the partial-transcript
-        pass if it completed and the final transcript text matches
-        closely enough to trust it; otherwise runs a fresh (but now
-        blocking, since we need an answer to proceed) register
-        detection pass on the final transcript.
+        pass if it completed AND the text it ran on is a prefix of (or
+        equal to) the final transcript — meaning nothing material
+        changed between the partial and the final, so the reading is
+        still trustworthy. Otherwise runs a fresh (blocking, since we
+        need an answer to proceed) register detection pass on the
+        final transcript.
+
+        A speculative task that hasn't finished, or whose source text
+        diverged from the final transcript (e.g. STT revised an early
+        word), is cancelled rather than abandoned — an unreferenced
+        background task left running is a resource leak and makes
+        failures in it silently invisible.
         """
-        if speculative_task is not None:
+        text_still_valid = event.text.startswith(speculative_source_text)
+
+        if speculative_task is not None and text_still_valid:
             try:
-                speculative_result = await asyncio.wait_for(
-                    asyncio.shield(speculative_task), timeout=0.05
+                if speculative_task.done():
+                    # No race here, so no timeout needed — the result
+                    # is already available.
+                    return speculative_task.result()
+                return await asyncio.wait_for(speculative_task, timeout=0.05)
+            except asyncio.TimeoutError:
+                # Didn't finish in time to be worth waiting further —
+                # cancel it explicitly rather than shielding-and-
+                # forgetting, so it doesn't keep running unobserved.
+                speculative_task.cancel()
+                logger.debug(
+                    "orchestrator: speculative register detection for "
+                    "segment did not finish in time, cancelling and "
+                    "running fresh"
                 )
-                # Cheap heuristic: if the speculative pass ran on text
-                # that's a prefix of (or equal to) the final text, trust
-                # it rather than paying for a second LLM call. A more
-                # sophisticated diff could be used here if false-positive
-                # reuse becomes a problem in practice.
-                if speculative_result is not None:
-                    return speculative_result
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                pass
+            except Exception:
+                # RegisterDetector.detect() is documented to never
+                # raise (it resolves failures to neutral_fallback()
+                # internally — see pipeline/AGENTS.md), so reaching
+                # this branch means that contract was violated
+                # somewhere. Defend anyway rather than trusting a
+                # cross-module guarantee blindly: log it and fall
+                # through to a fresh detection call instead of letting
+                # an unexpected exception here kill the whole session.
+                logger.exception(
+                    "orchestrator: speculative register-detection task "
+                    "raised unexpectedly (RegisterDetector should never "
+                    "raise) — running a fresh detection instead"
+                )
+
+        elif speculative_task is not None and not speculative_task.done():
+            # Text diverged from what the speculative pass was run on
+            # — its result would no longer be a reliable reading for
+            # this final transcript. Cancel rather than let it run to
+            # completion for no purpose.
+            speculative_task.cancel()
 
         return await self._run_register_detection(event)
 
