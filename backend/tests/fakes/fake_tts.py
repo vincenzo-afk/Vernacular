@@ -4,7 +4,7 @@ See TESTING.md.
 """
 
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from app.schemas.style_metadata import StyleMetadata
 
