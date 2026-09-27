@@ -22,6 +22,7 @@ contract this module must satisfy.
 import json
 import logging
 
+from app.pipeline.llm_response_utils import strip_markdown_fence
 from app.pipeline.stt import TranscriptEvent
 from app.schemas.style_metadata import StyleMetadata
 
@@ -213,12 +214,6 @@ class RegisterDetector:
         wrapping (markdown code fences) defensively, since not every
         model reliably honors "output only JSON" instructions.
         """
-        text = raw.strip()
-        if text.startswith("```"):
-            text = text.strip("`")
-            if text.lower().startswith("json"):
-                text = text[4:]
-            text = text.strip()
-
+        text = strip_markdown_fence(raw)
         data = json.loads(text)
         return StyleMetadata(**data)
