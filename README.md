@@ -104,7 +104,7 @@ vernacular/
 │   │   ├── main.py                    # FastAPI app entrypoint
 │   │   ├── pipeline/
 │   │   │   ├── AGENTS.md              # stricter, scoped rules for this directory
-│   │   │   ├── stt.py                 # AssemblyAI Realtime STT client (stub)
+│   │   │   ├── stt.py                 # AssemblyAI v3 realtime STT client (implemented)
 │   │   │   ├── register_detector.py   # LLM-based register/style detection (implemented)
 │   │   │   ├── translator.py          # LLM translation + register mapping (implemented)
 │   │   │   ├── tts.py                 # ElevenLabs TTS client + style mapping (implemented)
@@ -138,7 +138,7 @@ vernacular/
     └── style-metadata-schema.md      # Full schema reference + examples
 ```
 
-See `ARCHITECTURE.md` §6 for exactly what's implemented vs. stubbed as of the latest change — in short: the register detector, translator, TTS style mapping, and orchestrator concurrency are real, tested implementations; the AssemblyAI STT integration is the main remaining stub.
+See `ARCHITECTURE.md` §6 for exactly what's implemented vs. planned as of the latest change — in short: every backend pipeline stage (STT, register detection, translation, TTS, orchestration) is a real, tested implementation, and the frontend's WebSocket client and mic capture are wired end-to-end. The two biggest remaining gaps are translated-audio playback in the frontend and validation against live provider accounts (everything so far is verified against fakes and, for STT, a real local server speaking the same protocol).
 
 ---
 
@@ -180,6 +180,16 @@ PYTHONPATH=. pytest tests/unit tests/integration
 ```
 
 This runs entirely offline against fakes — no API keys required (see [TESTING.md](./TESTING.md)). Live-API tests are opt-in and separate.
+
+### Type-checking and linting the frontend
+
+```bash
+cd frontend
+npm run typecheck   # tsc --noEmit
+npm run lint        # eslint, including react-hooks rules
+```
+
+Run both before considering a frontend change done — `page.tsx`'s mic-capture and WebSocket wiring depends on `useCallback`/`useRef` being correctly scoped, and `react-hooks/exhaustive-deps` (enabled in `eslint.config.mjs`) is what catches a missing dependency in those hooks.
 
 ---
 
