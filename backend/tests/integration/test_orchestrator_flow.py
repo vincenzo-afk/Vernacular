@@ -12,7 +12,7 @@ import pytest
 
 from app.pipeline.orchestrator import SessionOrchestrator
 from app.pipeline.register_detector import RegisterDetector
-from app.pipeline.stt import STTProvider, TranscriptEvent, WordTiming
+from app.pipeline.stt import TranscriptEvent, WordTiming
 from app.pipeline.translator import Translator
 from app.schemas.style_metadata import Tone
 from tests.fakes.fake_llm import FakeLLMClient, ScriptedResponse
