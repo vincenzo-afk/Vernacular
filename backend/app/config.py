@@ -4,10 +4,14 @@ see CLAUDE.md / AGENTS.md constraints. Populate a local .env from
 .env.example.
 """
 
-from pydantic_settings import BaseSettings
+from functools import lru_cache
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env")
+
     assemblyai_api_key: str
     elevenlabs_api_key: str
 
@@ -24,8 +28,21 @@ class Settings(BaseSettings):
 
     register_confidence_threshold: float = 0.5
 
-    class Config:
-        env_file = ".env"
 
-
-settings = Settings()  # type: ignore[call-arg]
+@lru_cache
+def get_settings() -> Settings:
+    """
+    Lazily constructs and caches the Settings singleton on first
+    access, rather than at import time. This matters concretely: every
+    pipeline module reaches app.config transitively via
+    app/ws/session.py, so if `Settings()` were instantiated eagerly at
+    module load (as it originally was), simply *importing* session.py
+    — including from a future test for it, or from any tool that
+    inspects the module — would crash with a pydantic ValidationError
+    in any environment without a populated .env, CI included. Deferring
+    construction to first real use means import always succeeds, and
+    the clear validation error only surfaces when settings are actually
+    needed (i.e. when a session is handled), which is also a much
+    easier moment to see and diagnose the error from.
+    """
+    return Settings()  # type: ignore[call-arg]
