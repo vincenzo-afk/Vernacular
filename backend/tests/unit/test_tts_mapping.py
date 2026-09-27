@@ -3,6 +3,8 @@ See TESTING.md — pure mapping tests for style_to_voice_settings(), no
 network calls involved.
 """
 
+from itertools import pairwise
+
 import pytest
 
 from app.pipeline.tts import style_to_voice_settings
@@ -23,6 +25,48 @@ def test_sarcastic_tone_lowers_stability_and_raises_style():
     )
     assert sarcastic.stability < neutral.stability
     assert sarcastic.style > neutral.style
+
+
+def test_sarcasm_score_blend_is_continuous_no_discontinuity_at_threshold():
+    """
+    Regression test: sarcasm_score used to only blend toward sarcastic
+    settings when > 0.5, gated with an `if`, producing a hard jump in
+    stability/style right at the 0.5 boundary instead of a smooth
+    ramp from sarcasm_score=0. Verify the blend is now monotonic and
+    has no discontinuity around 0.5.
+    """
+    scores = [0.0, 0.1, 0.3, 0.49, 0.5, 0.51, 0.7, 0.9, 1.0]
+    stabilities = [
+        style_to_voice_settings(
+            StyleMetadata(tone=Tone.NEUTRAL, sarcasm_score=s, confidence=0.9)
+        ).stability
+        for s in scores
+    ]
+
+    # Monotonically non-increasing as sarcasm_score rises (stability
+    # should only ever move toward the lower sarcastic-tone value).
+    for a, b in pairwise(stabilities):
+        assert b <= a + 1e-9
+
+    # No jump larger than what a uniform step of ~0.02 in sarcasm_score
+    # could plausibly account for. The old buggy code jumped by ~0.2 in
+    # stability between score=0.49 (unblended) and score=0.51.
+    idx_49 = scores.index(0.49)
+    idx_51 = scores.index(0.51)
+    jump = stabilities[idx_49] - stabilities[idx_51]
+    assert jump < 0.05, (
+        f"stability jumped by {jump:.3f} between sarcasm_score=0.49 and "
+        "0.51 -- the blend should be continuous, not a step function"
+    )
+
+
+def test_zero_sarcasm_score_is_a_true_no_op_on_the_blend():
+    baseline = style_to_voice_settings(StyleMetadata(tone=Tone.WARM, confidence=0.9))
+    with_zero_sarcasm = style_to_voice_settings(
+        StyleMetadata(tone=Tone.WARM, sarcasm_score=0.0, confidence=0.9)
+    )
+    assert baseline.stability == with_zero_sarcasm.stability
+    assert baseline.style == with_zero_sarcasm.style
 
 
 def test_high_sarcasm_score_pulls_toward_sarcastic_settings_even_with_other_tone():
