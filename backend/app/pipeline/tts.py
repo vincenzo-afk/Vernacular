@@ -94,18 +94,20 @@ def style_to_voice_settings(style: StyleMetadata) -> ElevenLabsVoiceSettings:
     """
     stability, style_exaggeration = _TONE_TO_STABILITY_STYLE[style.tone]
 
-    if style.sarcasm_score > 0.5:
-        # Blend toward the sarcastic-tone values proportionally to
-        # sarcasm_score, even if the classified tone was something else
-        # (e.g. a sarcastic remark classified primarily as "annoyed").
-        sarcastic_stability, sarcastic_style = _TONE_TO_STABILITY_STYLE[
-            Tone.SARCASTIC
-        ]
-        weight = min(1.0, style.sarcasm_score)
-        stability = stability * (1 - weight) + sarcastic_stability * weight
-        style_exaggeration = (
-            style_exaggeration * (1 - weight) + sarcastic_style * weight
-        )
+    # Blend continuously toward the sarcastic-tone values, weighted by
+    # sarcasm_score, even if the classified tone was something else
+    # (e.g. a sarcastic remark classified primarily as "annoyed").
+    # Applied at every score (not gated behind a threshold) so this is
+    # a genuine smooth ramp rather than a step function — a gate here
+    # would mean e.g. sarcasm_score=0.49 and sarcasm_score=0.51 produce
+    # wildly different settings despite being nearly identical inputs,
+    # which is exactly the kind of discontinuity a continuous blend is
+    # supposed to avoid. At sarcasm_score=0 the blend weight is 0, so
+    # this is a no-op for genuinely non-sarcastic readings.
+    sarcastic_stability, sarcastic_style = _TONE_TO_STABILITY_STYLE[Tone.SARCASTIC]
+    weight = min(1.0, max(0.0, style.sarcasm_score))
+    stability = stability * (1 - weight) + sarcastic_stability * weight
+    style_exaggeration = style_exaggeration * (1 - weight) + sarcastic_style * weight
 
     similarity_boost = 0.75  # kept high by default to preserve cloned-voice identity
 
@@ -202,7 +204,20 @@ class FallbackTTS:
     upstream (already baked into the translated text) rather than
     trying to fake fine-grained delivery control this provider doesn't
     support.
+
+    Voice identity: ElevenLabs voice IDs (including cloned-voice IDs)
+    are meaningless to OpenAI's TTS API, which only accepts a small
+    fixed set of stock voice names (alloy, echo, fable, onyx, nova,
+    shimmer). TTSProvider's interface takes a single `voice_id` string
+    shared across providers, but that ID is provider-specific — this
+    class deliberately ignores whatever voice_id it's given and always
+    uses DEFAULT_VOICE, rather than passing an ElevenLabs ID through to
+    an API that would reject it. This means a cloned voice's identity
+    is lost during fallback, which is exactly the kind of degradation
+    ARCHITECTURE.md §5 says must be surfaced to the user, not hidden.
     """
+
+    DEFAULT_VOICE = "alloy"
 
     def __init__(self, provider: str, api_key: str) -> None:
         self._provider = provider
@@ -229,13 +244,22 @@ class FallbackTTS:
         speed = _PACE_TO_SPEED[style.pace]
         client = self._get_client()
 
+        if voice_id and voice_id != "default":
+            logger.warning(
+                "fallback_tts: caller passed voice_id=%s, but this "
+                "provider cannot honor a primary-provider voice ID "
+                "(see class docstring) — using %s instead",
+                voice_id,
+                self.DEFAULT_VOICE,
+            )
+
         logger.debug(
             "fallback_tts.synthesize provider=%s speed=%s", self._provider, speed
         )
 
         async with client.audio.speech.with_streaming_response.create(
             model="tts-1",
-            voice=voice_id if voice_id != "default" else "alloy",
+            voice=self.DEFAULT_VOICE,
             input=text,
             speed=speed,
         ) as response:
