@@ -19,6 +19,7 @@ See backend/app/pipeline/AGENTS.md for the exact failure-handling
 contract this module must satisfy.
 """
 
+import asyncio
 import json
 import logging
 
@@ -163,6 +164,15 @@ def _build_user_prompt(transcript: TranscriptEvent) -> str:
 class RegisterDetector:
     CONFIDENCE_THRESHOLD = 0.5
 
+    # Hard upper bound on one detection. ARCHITECTURE.md §3 budgets
+    # ~400ms for this stage and §5 promises a timeout fallback; without
+    # a bound, one slow LLM call stalls the translator (which waits on
+    # this result) and freezes the live session. Deliberately generous
+    # relative to the budget: a *late* reading is still better than a
+    # neutral one when we can afford it, but an unbounded wait never
+    # is. Tune against real latency numbers (tests/live/).
+    TIMEOUT_S = 1.5
+
     def __init__(self, llm_client: LLMClient) -> None:
         self._llm_client = llm_client
 
@@ -178,7 +188,16 @@ class RegisterDetector:
             return StyleMetadata.neutral_fallback()
 
         try:
-            result = await self._call_llm(transcript)
+            result = await asyncio.wait_for(
+                self._call_llm(transcript), timeout=self.TIMEOUT_S
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "register_detector: no answer within %.1fs, falling back "
+                "to neutral rather than stalling the segment",
+                self.TIMEOUT_S,
+            )
+            return StyleMetadata.neutral_fallback()
         except Exception:
             logger.warning(
                 "register_detector: LLM call failed, falling back to neutral",
