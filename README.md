@@ -138,7 +138,7 @@ vernacular/
     └── style-metadata-schema.md      # Full schema reference + examples
 ```
 
-See `ARCHITECTURE.md` §6 for exactly what's implemented vs. planned as of the latest change — in short: every backend pipeline stage (STT, register detection, translation, TTS, orchestration) is a real, tested implementation, and the frontend's WebSocket client and mic capture are wired end-to-end. The two biggest remaining gaps are translated-audio playback in the frontend and validation against live provider accounts (everything so far is verified against fakes and, for STT, a real local server speaking the same protocol).
+See `ARCHITECTURE.md` §6 for exactly what's implemented vs. planned as of the latest change — in short: every backend pipeline stage (STT, register detection, translation, TTS, orchestration) is a real, tested implementation, and the frontend's WebSocket client and mic capture are wired end-to-end. The biggest remaining gap is that none of it has run against live provider accounts or been heard on real hardware — everything is verified against fakes and, for STT, a real local server speaking the same protocol.
 
 ---
 
