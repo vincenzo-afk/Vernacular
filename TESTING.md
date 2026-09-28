@@ -29,12 +29,21 @@ backend/tests/
 │   ├── test_fallback_tts.py              # FallbackTTS voice-identity handling
 │   ├── test_stt.py                       # AssemblyAISTT against a real local
 │   │                                     #   fake server speaking its wire protocol
+│   ├── test_stt_reconnect.py             # drop-and-resume: live audio must survive a reconnect
 │   ├── test_orchestrator_speculative_resolution.py  # partial-vs-final
 │   │                                     #   register-detection reuse logic
 │   ├── test_config_and_session.py        # lazy settings loading, LLM adapter selection
-│   └── test_app_import.py                # whole app import chain + /health endpoint
+│   ├── test_app_import.py                # whole app import chain + /health endpoint
+│   ├── test_tts_audio_format.py          # both providers are asked for raw PCM16 24 kHz
+│   ├── test_wire_contract.py             # backend wire JSON == frontend ws-client.ts types
+│   ├── test_docs_examples.py             # every StyleMetadata example in the docs validates
+│   ├── test_latency.py                   # percentile/budget math + real-orchestrator timing
+│   └── test_benchmark.py                 # benchmark CLI: dry-run correctness, live guard rails
 ├── integration/
-│   └── test_orchestrator_flow.py   # full pipeline, all fakes wired together
+│   ├── test_orchestrator_flow.py         # full pipeline, all fakes wired together
+│   ├── test_tts_failover.py              # sticky primary -> fallback TTS failover
+│   ├── test_streaming_latency.py         # audio streams; it is NOT buffered per clip
+│   └── test_ws_roundtrip.py              # real WebSocket: ready -> segment -> audio frames
 └── live/                            # opt-in, requires real API keys, skipped by default
     └── (empty scaffold — see "Live tests" below; nothing implemented yet)
 ```
@@ -74,15 +83,24 @@ Test one pipeline stage in isolation, with every dependency faked.
 - **`test_tts_mapping.py`**: does `StyleMetadata` map to the correct ElevenLabs style parameters? (This is a pure mapping test — no network calls.)
 - **`test_fallback_tts.py`**: does `FallbackTTS` correctly refuse to pass a primary-provider (ElevenLabs-shaped) voice ID through to OpenAI's incompatible fixed voice enum, using a fake OpenAI-shaped client rather than the real SDK (which isn't an offline-test dependency)?
 - **`test_stt.py`**: `AssemblyAISTT` against a real local WebSocket server speaking the same Begin/Turn/Termination/Error protocol AssemblyAI's v3 streaming API uses — exercises the actual connection and parsing code, not a mock of it. Also covers the stress-detection heuristic and turn-message parsing as pure functions.
+- **`test_stt_reconnect.py`**: a real local server kills the first connection mid-stream. Asserts live audio resumes on the new connection (not just a replay), replayed frames arrive in order before live ones, nothing is lost or reordered, and the caller's audio source is not closed by the reconnect. All four fail against the original design (verified), which closed the source on the first drop and silently killed the mic feed.
 - **`test_orchestrator_speculative_resolution.py`**: targeted coverage of `_resolve_style_for_final`'s prefix-validity check — does it correctly reuse a completed speculative register-detection result when the final transcript is a continuation of the partial it ran on, and correctly discard/cancel it and run fresh when the text diverged?
 - **`test_config_and_session.py`**: does `get_settings()` load lazily (not crash on import) and raise clearly when required env vars are missing? Does `_build_llm_client` select the right adapter per `llm_provider` and raise `NotImplementedError` for unsupported ones (Groq, Google)?
 - **`test_app_import.py`**: does the whole app import chain (`main.py` → `ws/session.py` → `config.py`) import cleanly with zero env vars configured, and does `/health` respond correctly?
+- **`test_tts_audio_format.py`**: both `ElevenLabsTTS` and `FallbackTTS` explicitly request raw PCM16 at 24 kHz. Before this, neither call named a format and both returned MP3, which a browser cannot decode chunk-by-chunk.
+- **`test_wire_contract.py`**: *drift guard.* Parses `frontend/lib/ws-client.ts` and asserts its `ReadyMessage`, `AudioFormat`, `SegmentMessage` and `StyleTag` fields exactly equal what the backend serializes. There is no schema codegen, so this is what makes the manual sync enforceable. Verified to fail when a field is removed from either side.
+- **`test_docs_examples.py`**: *drift guard.* Extracts every `StyleMetadata`-shaped JSON block from the markdown docs and validates it against the real pydantic model. It once caught a flagship example using an invalid `"informal"` formality value.
+- **`test_latency.py`**: percentile math, that over-budget is judged on p90 rather than the mean, that register detection is excluded from the critical path, and — end to end — that a delay injected into the TTS lands in the `tts_first_byte` stage of the real orchestrator and not in `translation`.
+- **`test_benchmark.py`**: dry-run exits 0, labels its numbers as not real, and reports the injected delays in the right stages; a mode is required and the two are mutually exclusive; `--live` without credentials, or without a voice ID, exits 1 and never runs (it will not guess a voice). These never touch the network.
 
 ### Integration tests (`tests/integration/`)
 
 Test the orchestrator wiring multiple fakes together — this is where you catch "the stages don't actually compose correctly" bugs that unit tests miss.
 
 - **`test_orchestrator_flow.py`**: feed a fake audio stream through `SessionOrchestrator.run()` with a scripted STT + `FakeLLMClient` + `FakeTTS`, assert that translated audio comes out, that `StageTiming` entries were recorded for every stage, and that a register-detector failure or a TTS failure mid-stream doesn't kill the session.
+- **`test_tts_failover.py`**: on primary TTS failure the orchestrator switches to the fallback for the rest of the session and never flaps back; the failing segment is retried on the fallback; fallback segments are flagged `degraded`; with no fallback (or a failing one) segments are dropped without killing the session.
+- **`test_streaming_latency.py`**: the tests that distinguish *streaming* from *buffering*. The TTS fake yields one chunk and then blocks; the first chunk must reach the consumer while the TTS is still blocked. Also covers `tts_first_byte` timing and the rule that a mid-clip failure ends the segment rather than splicing a second voice into it. Verified to fail (timeout) if the orchestrator is changed to buffer the clip.
+- **`test_ws_roundtrip.py`**: drives `run_session()` over a real FastAPI WebSocket and pins the protocol order the browser depends on (`ready`, then `segment`, then binary frames), byte-exact audio, and that re-framing at an odd byte offset still reassembles the original samples.
 
 ### Live tests (`tests/live/`)
 
@@ -102,25 +120,35 @@ Real API calls. Skipped by default. Use sparingly — these exist to catch actua
 
 ## Latency benchmarking (manual, not CI)
 
-The ~2s end-to-end latency target (`ARCHITECTURE.md` §3) is a real-world property measured against live APIs, not something the offline test suite can verify. Benchmark it manually:
+The ~2s end-to-end target (`ARCHITECTURE.md` §3) is a property of real providers, so the offline suite can only prove the *measurement* is correct, not the number. Two entry points, deliberately separate:
 
 ```bash
 cd backend
-python -m tests.live.benchmark_latency --target-language es --utterance-count 10
+python -m app.benchmark --dry-run                       # offline; proves the harness works
+python -m app.benchmark --live --language es --repeats 2  # REAL providers; bills your accounts
 ```
 
-This script (to be implemented — see `backend/tests/live/` scaffold) should record stage-level timings for real utterances against real provider APIs and report p50/p90 for each stage plus end-to-end. Run this after any change to the orchestrator's concurrency strategy, the register-detection prompt, or provider selection — these are the areas most likely to silently regress latency without breaking correctness.
+- **`--dry-run`** uses fake providers with injected delays (50ms detection, 150ms translation, 100ms TTS first byte) and prints a banner saying so. The numbers it shows are the delays we injected. They say nothing about any real service; the run only shows the harness and report work.
+- **`--live`** runs the fixed utterance set (`app.benchmark.UTTERANCES`: sarcasm, urgency, formal, a one-word fragment, a longer neutral line) through the real LLM and ElevenLabs. It needs API keys and `BENCHMARK_VOICE_ID` in `.env`, refuses to run without them, and exits 1. It requires an explicit flag because it costs money. It loads the same settings as the server, so `ASSEMBLYAI_API_KEY` must be set (a placeholder is fine — STT is not called).
+
+The report gives p50 / p90 / max per stage against the budgets in `app/latency.py`, judged on **p90** (a good mean can hide a slow tail), plus a critical-path sum of translation + `tts_first_byte`. Register detection is excluded from that sum on purpose: it runs speculatively during STT and is normally finished when the final transcript arrives.
+
+**What this does not measure:** STT endpointing latency (needs a live AssemblyAI audio stream) and network overhead to the browser. The report says so; add those from a real session before comparing anything to 2000ms. Until `--live` has been run, **there is no real latency number for this system.**
+
+Run it after changing the orchestrator's concurrency, the register-detection or translation prompts, or provider/model selection. Those are the changes most likely to regress latency without failing any test.
 
 ---
 
 ## Frontend checks (`frontend/`)
 
-There's no frontend test framework wired up yet (no Jest/Vitest/Playwright) — for now, "tested" for frontend code means passing both of the following, which are fast enough to run on every change and catch the two most common classes of bug in this codebase's frontend:
+There's no browser test framework (no Playwright) — only Node's built-in `node:test` for pure logic. "Tested" for frontend code means passing all three of the following, which are fast enough to run on every change and catch the two most common classes of bug in this codebase's frontend:
 
 ```bash
 cd frontend
 npm run typecheck   # tsc --noEmit — catches wire-format drift between
                      #   ws-client.ts and what components actually consume
+npm test             # node:test unit tests for lib/pcm.ts (odd-byte alignment,
+                     #   gapless scheduling) — no browser needed
 npm run lint         # eslint with react-hooks/exhaustive-deps active —
                      #   catches missing dependencies in useCallback/useEffect,
                      #   which is the single easiest mistake to make in
