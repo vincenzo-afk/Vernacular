@@ -8,11 +8,17 @@ frontend/components/ToneTags.tsx and frontend/lib/ws-client.ts, which
 this wire format must stay in sync with — see CONTRIBUTING.md "Known
 gaps" on why that sync is currently manual).
 
-Wire format (backend -> frontend), one JSON text message per completed
-segment, followed by binary audio-chunk messages for that segment:
+Wire format (backend -> frontend). First, once per session:
+
+    {"type": "ready", "audio": {"encoding": "pcm_s16le",
+                                "sample_rate": 24000, "channels": 1}}
+
+declaring the format of every binary frame that follows. Then one JSON
+text message per completed segment, followed by binary audio-chunk
+messages for that segment:
 
     {"type": "segment", "source_text": "...", "translated_text": "...",
-     "style": {...StyleMetadata fields...}}
+     "style": {...StyleMetadata fields...}, "degraded": false}
     <binary audio chunk>
     <binary audio chunk>
     ...
@@ -24,13 +30,65 @@ import logging
 from fastapi import WebSocket, WebSocketDisconnect
 
 from app.config import get_settings
-from app.pipeline.orchestrator import SessionOrchestrator
+from app.pipeline.orchestrator import (
+    AudioChunk,
+    SegmentOutput,
+    SegmentStart,
+    SessionOrchestrator,
+)
 from app.pipeline.register_detector import RegisterDetector
 from app.pipeline.stt import AssemblyAISTT
 from app.pipeline.translator import Translator
-from app.pipeline.tts import ElevenLabsTTS
+from app.pipeline.tts import (
+    AUDIO_CHANNELS,
+    AUDIO_ENCODING,
+    AUDIO_SAMPLE_RATE,
+    ElevenLabsTTS,
+    FallbackTTS,
+)
 
 logger = logging.getLogger("vernacular.ws.session")
+
+
+def ready_to_wire() -> dict:
+    """
+    First message on every session. Declares the audio format of all
+    binary frames that follow, so the client never hardcodes it: the
+    server is the single source of truth (pipeline/tts.py). Mirrors
+    `ReadyMessage` in frontend/lib/ws-client.ts.
+    """
+    return {
+        "type": "ready",
+        "audio": {
+            "encoding": AUDIO_ENCODING,
+            "sample_rate": AUDIO_SAMPLE_RATE,
+            "channels": AUDIO_CHANNELS,
+        },
+    }
+
+
+def segment_start_to_wire(segment: SegmentStart | SegmentOutput) -> dict:
+    """
+    The JSON control message sent ahead of each segment's binary audio
+    chunks. Extracted from handle_session so the wire contract is a
+    pure, testable function: its keys must match `SegmentMessage` in
+    frontend/lib/ws-client.ts exactly (there is no schema codegen --
+    tests/unit/test_wire_contract.py cross-checks the two).
+
+    Accepts either the streaming SegmentStart or the buffered
+    SegmentOutput; they carry the same fields.
+    """
+    return {
+        "type": "segment",
+        "source_text": segment.source_text,
+        "translated_text": segment.translated_text,
+        "style": segment.style.model_dump(mode="json"),
+        "degraded": segment.degraded,
+    }
+
+
+# Backwards-compatible name used by the wire-contract tests.
+segment_to_wire = segment_start_to_wire
 
 
 def _build_llm_client(settings):
@@ -99,20 +157,21 @@ async def handle_session(websocket: WebSocket, target_language: str) -> None:
     translator = Translator(llm_client=llm_client)
 
     tts = ElevenLabsTTS(api_key=settings.elevenlabs_api_key)
+    fallback_tts = None
     if settings.fallback_tts_api_key:
-        # See CONTRIBUTING.md "Known gaps" — SessionOrchestrator does
-        # not currently accept or switch to a fallback TTS provider on
-        # failure (that provider-switch logic in pipeline/AGENTS.md's
-        # failure-handling contract for tts.py isn't implemented yet).
-        # Warn plainly at session start, when it's actually actionable,
-        # rather than burying this in a crash-path finally block where
-        # it would only ever be seen after something has already gone
-        # wrong and the configured fallback still didn't help.
+        # Sticky failover target: the orchestrator switches to this on
+        # the first ElevenLabs failure and stays on it for the rest of
+        # the session (see pipeline/AGENTS.md). Segments it produces
+        # are flagged `degraded` on the wire.
+        fallback_tts = FallbackTTS(
+            provider=settings.fallback_tts_provider,
+            api_key=settings.fallback_tts_api_key,
+        )
+    else:
         logger.warning(
-            "ws.session: FALLBACK_TTS_API_KEY is configured but "
-            "SessionOrchestrator does not yet use a fallback provider on "
-            "ElevenLabs failure — this session will NOT fail over to it. "
-            "See CONTRIBUTING.md 'Known gaps'."
+            "ws.session: no FALLBACK_TTS_API_KEY configured — an "
+            "ElevenLabs failure will drop segments instead of failing "
+            "over to a fallback voice."
         )
 
     orchestrator = SessionOrchestrator(
@@ -120,10 +179,26 @@ async def handle_session(websocket: WebSocket, target_language: str) -> None:
         register_detector=register_detector,
         translator=translator,
         tts=tts,
+        fallback_tts=fallback_tts,
         target_language=target_language,
         voice_id="default",  # TODO: voice cloning calibration step, gated
         # on explicit consent — see CONTRIBUTING.md "Known gaps"
     )
+
+    await run_session(websocket, orchestrator)
+
+
+async def run_session(websocket: WebSocket, orchestrator: SessionOrchestrator) -> None:
+    """
+    The wire-protocol half of a session, separated from provider
+    construction (handle_session) so it can be exercised end-to-end
+    with fake providers over a real socket -- see
+    tests/integration/test_ws_roundtrip.py.
+
+    Sends the `ready` message first, then streams `segment` messages
+    each followed by that segment's binary audio frames.
+    """
+    await websocket.send_text(json.dumps(ready_to_wire()))
 
     async def audio_in():
         while True:
@@ -131,19 +206,17 @@ async def handle_session(websocket: WebSocket, target_language: str) -> None:
             yield chunk
 
     try:
-        async for segment in orchestrator.run(audio_in()):
-            await websocket.send_text(
-                json.dumps(
-                    {
-                        "type": "segment",
-                        "source_text": segment.source_text,
-                        "translated_text": segment.translated_text,
-                        "style": segment.style.model_dump(mode="json"),
-                    }
-                )
-            )
-            for chunk in segment.audio_chunks:
-                await websocket.send_bytes(chunk)
+        # Stream, don't buffer: each audio frame is forwarded the
+        # moment the TTS provider emits it, so the listener hears the
+        # start of a sentence while the rest is still being
+        # synthesized (CLAUDE.md constraint #2, ARCHITECTURE.md §3).
+        async for event in orchestrator.run_stream(audio_in()):
+            if isinstance(event, SegmentStart):
+                await websocket.send_text(json.dumps(segment_start_to_wire(event)))
+            elif isinstance(event, AudioChunk):
+                await websocket.send_bytes(event.data)
+            # SegmentEnd needs no wire message: the next `segment`
+            # JSON (or session end) delimits the audio frames.
     except WebSocketDisconnect:
         logger.info("ws.session: client disconnected")
     except Exception:
