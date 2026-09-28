@@ -5,6 +5,7 @@ import Waveform from "@/components/Waveform";
 import LiveTranscript from "@/components/LiveTranscript";
 import ToneTags from "@/components/ToneTags";
 import { VernacularSession, type StyleTag } from "@/lib/ws-client";
+import { PcmPlayer } from "@/lib/player";
 
 /**
  * Main demo UI. Captures mic audio as raw PCM16 frames (matching what
@@ -76,11 +77,13 @@ export default function Home() {
   const [sourceText, setSourceText] = useState("");
   const [translatedText, setTranslatedText] = useState("");
   const [styleTag, setStyleTag] = useState<StyleTag | null>(null);
+  const [degraded, setDegraded] = useState(false);
 
   const sessionRef = useRef<VernacularSession | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
+  const playerRef = useRef<PcmPlayer | null>(null);
 
   const stop = useCallback(() => {
     sessionRef.current?.close();
@@ -95,11 +98,15 @@ export default function Home() {
     audioContextRef.current?.close();
     audioContextRef.current = null;
 
+    playerRef.current?.close();
+    playerRef.current = null;
+
     setConnectionState("idle");
   }, []);
 
   const start = useCallback(async () => {
     setErrorMessage(null);
+    setDegraded(false);
     setConnectionState("connecting");
 
     let stream: MediaStream;
@@ -118,6 +125,12 @@ export default function Home() {
     const audioContext = new AudioContext();
     audioContextRef.current = audioContext;
 
+    // Output side. Created here, inside the Start click's call stack,
+    // so the browser's autoplay policy lets it run.
+    const player = new PcmPlayer();
+    void player.resume();
+    playerRef.current = player;
+
     const workletBlob = new Blob([WORKLET_SOURCE], {
       type: "application/javascript",
     });
@@ -131,19 +144,20 @@ export default function Home() {
     const session = new VernacularSession({
       wsUrl: WS_URL,
       targetLanguage,
-      onAudioChunk: (chunk) => {
-        // TODO: play translated audio back through an AudioContext
-        // output node. Not yet implemented -- see ARCHITECTURE.md §6.
-        // Wiring this up needs a jitter-buffer / scheduling strategy
-        // (segments arrive as a burst of chunks, not a smooth stream)
-        // that's substantial enough to warrant its own change rather
-        // than a quick addition here.
-        void chunk;
-      },
+      onReady: (audio) => player.setFormat(audio),
+      onAudioChunk: (chunk) => player.push(chunk),
       onSegment: (segment) => {
         setSourceText(segment.source_text);
         setTranslatedText(segment.translated_text);
         setStyleTag(segment.style);
+        // Sticky on the backend (it never flaps back to the primary
+        // voice mid-session), so mirror that: once degraded, stay
+        // flagged until the session is restarted.
+        if (segment.degraded) setDegraded(true);
+        // This segment's audio frames follow this message. Drop any
+        // half-sample left over from the previous segment so it can't
+        // shift this one's first sample.
+        player.endSegment();
       },
       onError: (message) => {
         setConnectionState("error");
@@ -222,6 +236,17 @@ export default function Home() {
       {errorMessage && (
         <p className="text-sm text-red-400 max-w-md text-center">
           {errorMessage}
+        </p>
+      )}
+
+      {degraded && (
+        <p
+          role="status"
+          className="rounded bg-amber-900/60 px-3 py-1 text-xs text-amber-200 max-w-md text-center"
+        >
+          Fallback voice active — the primary voice provider failed, so
+          speaker identity and delivery style are reduced for the rest of
+          this session.
         </p>
       )}
 
