@@ -127,3 +127,30 @@ async def test_empty_transcript_short_circuits_without_calling_llm():
 
     assert result == StyleMetadata.neutral_fallback()
     assert len(llm.calls) == 0
+
+
+class _HangingLLM:
+    async def complete(self, **kwargs):
+        import asyncio
+
+        await asyncio.sleep(3600)  # a provider that never answers
+
+
+@pytest.mark.asyncio
+async def test_hung_llm_times_out_and_falls_back_instead_of_stalling():
+    """
+    Regression: the docs promised a timeout fallback but detect() had
+    no timeout, so a hung provider stalled the segment (and, since the
+    translator waits on the style, the whole live session) forever.
+    """
+    import asyncio
+    import time
+
+    detector = RegisterDetector(llm_client=_HangingLLM())
+    detector.TIMEOUT_S = 0.05  # keep the test fast
+
+    start = time.monotonic()
+    result = await asyncio.wait_for(detector.detect(_sarcastic_transcript()), timeout=2.0)
+
+    assert result == StyleMetadata.neutral_fallback()
+    assert time.monotonic() - start < 1.0
