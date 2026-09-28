@@ -28,6 +28,11 @@ class Settings(BaseSettings):
 
     register_confidence_threshold: float = 0.5
 
+    # Only used by `python -m app.benchmark --live`. Optional so normal
+    # operation needs no extra config; the benchmark fails with a clear
+    # message if it is unset (see app/benchmark.py).
+    benchmark_voice_id: str | None = None
+
 
 @lru_cache
 def get_settings() -> Settings:
