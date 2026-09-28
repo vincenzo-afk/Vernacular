@@ -6,7 +6,7 @@ Read [README.md](./README.md) and [ARCHITECTURE.md](./ARCHITECTURE.md) first if 
 
 If you're about to edit anything in `backend/app/pipeline/`, also read `backend/app/pipeline/AGENTS.md` — it has stricter, more specific rules for that directory (concurrency model, exact per-stage failure-handling contract) than what's summarized here. For process conventions (how to structure a change) see `CONTRIBUTING.md`; for what to test and how, see `TESTING.md`.
 
-Check `ARCHITECTURE.md` §6 before assuming a module is a stub or a real implementation — as of the last update, every backend pipeline stage (`stt.py`, `register_detector.py`, `translator.py`, `tts.py`, `orchestrator.py`) is a real, tested implementation, and the frontend's WebSocket client and mic capture (`lib/ws-client.ts`, `app/page.tsx`) are wired end-to-end. The main remaining gaps are translated-audio playback in the frontend and validation against live provider accounts — see `ARCHITECTURE.md` §6 for specifics.
+Check `ARCHITECTURE.md` §6 before assuming a module is a stub or a real implementation — as of the last update, every backend pipeline stage (`stt.py`, `register_detector.py`, `translator.py`, `tts.py`, `orchestrator.py`) is a real, tested implementation, and the frontend's WebSocket client and mic capture (`lib/ws-client.ts`, `app/page.tsx`) are wired end-to-end. The main remaining gap is validation against live provider accounts and real audio hardware — see `ARCHITECTURE.md` §6 for specifics.
 
 ---
 
