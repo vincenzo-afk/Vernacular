@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": ".test-build",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "jsx": "react",
+    "incremental": false,
+    "plugins": []
+  },
+  "include": ["lib/pcm.ts", "tests/**/*.ts"]
+}
