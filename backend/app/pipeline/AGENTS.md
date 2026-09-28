@@ -12,7 +12,7 @@ This directory is the hot path: audio in, translated audio out, ~2 seconds end-t
 | `register_detector.py` | Turn a transcript event into `StyleMetadata` | Raise an exception to its caller — always resolve to either a real reading or `StyleMetadata.neutral_fallback()` |
 | `translator.py` | Turn (source text, source style) into (translated text, target style) | Split translation and register-mapping into two separate LLM calls |
 | `tts.py` | Turn (translated text, style) into an audio byte stream | Wait for full text before starting synthesis, when the provider supports streaming input |
-| `orchestrator.py` | Wire the above four into one session, with correct concurrency and fallback | Let a single stage's failure kill the session |
+| `orchestrator.py` | Wire the above four into one session, with correct concurrency and fallback | Let a single stage's failure kill the session, or collect a whole audio clip before yielding it (use `run_stream()`; `run()` is a buffered convenience wrapper and must not be used on the latency path) |
 
 If you're adding code to one of these files, check that it's still doing only its one job. If a change to `translator.py` needs TTS-specific logic, that logic belongs in `tts.py`, reached via `TranslationResult`/`StyleMetadata`, not inlined into the translator.
 
@@ -41,10 +41,10 @@ If you're implementing `SessionOrchestrator.run()`, this means: use `asyncio.Que
 
 This is the concrete version of `ARCHITECTURE.md` §5, scoped to what code in this directory must actually do:
 
-- **`stt.py`**: on a dropped connection mid-session, reconnect with exponential backoff (start ~200ms, cap ~5s). Buffer up to `MAX_BUFFER_SECONDS` (define as a module constant, default 3s) of audio client-side during reconnect so an in-flight utterance isn't silently lost — but if the buffer overflows, drop oldest audio rather than growing unbounded.
-- **`register_detector.py`**: any exception from the LLM call, or a result with `confidence < CONFIDENCE_THRESHOLD`, resolves to `StyleMetadata.neutral_fallback()`. This method must never raise past its own boundary — callers should never need a try/except around `detect()`.
+- **`stt.py`**: on a dropped connection, reconnect with exponential backoff (0.2s doubling to a 5s cap) and replay up to `MAX_BUFFER_SECONDS` (3s) of recently *delivered* audio, then resume live audio; if the replay buffer overflows, drop oldest rather than grow unbounded. **Never iterate the caller's audio generator inside a per-connection task**: cancelling that task closes the generator and permanently kills the feed. Audio must flow source → queue → sender (see `ARCHITECTURE.md` §5 and `tests/unit/test_stt_reconnect.py`).
+- **`register_detector.py`**: any exception from the LLM call, a result with `confidence < CONFIDENCE_THRESHOLD`, **or no answer within `TIMEOUT_S` (1.5s)** resolves to `StyleMetadata.neutral_fallback()`. This method must never raise past its own boundary and must never wait unboundedly — the translator blocks on it, so a hung call would freeze the live session.
 - **`translator.py`**: one retry with a shorter timeout on the first failure. On a second failure, fall back to a literal/register-naive translation (still produce *some* output) rather than propagating an exception — a wrong-register translation is a better outcome than no translation.
-- **`tts.py`**: on primary provider (ElevenLabs) failure or rate-limit, the orchestrator should switch to `FallbackTTS` for the remainder of the session (not just the one failed utterance — flapping between providers mid-session produces jarring voice changes). Surface this switch to the frontend via a control message so the UI can indicate degraded fidelity (see `ARCHITECTURE.md` §5 — don't silently pretend it's full quality).
+- **`tts.py` / `orchestrator.py` (TTS failover)**: on primary provider (ElevenLabs) failure or rate-limit, the orchestrator switches to `FallbackTTS` for the **remainder of the session** — flapping between providers mid-session produces jarring voice changes, so it never switches back. The segment that hit the failure is retried on the fallback **only if the primary had emitted no audio yet**. Once bytes have gone out they cannot be taken back, and splicing a second voice into the middle of one utterance is worse than ending it early, so a mid-clip failure ends that segment with the audio already sent (the provider is still marked failed for later segments). Every segment produced by the fallback carries `degraded: true` on the wire and the UI must show it — never present reduced fidelity as full quality (`ARCHITECTURE.md` §5). Both providers must be asked for raw PCM16 mono 24 kHz (`AUDIO_*` constants in `tts.py`); do not rely on a provider default format.
 - **`orchestrator.py`**: no unhandled exception from any stage should propagate out of `run()` and kill the WebSocket session. Catch at each stage boundary, apply the fallback above, log it (see logging note below), and continue the session.
 
 ---
@@ -62,4 +62,5 @@ In addition to the repo-level checklist in `AGENTS.md`:
 - [ ] Does my change preserve the concurrency model above, or does it introduce an unnecessary sequential `await` on the hot path?
 - [ ] If I touched a stage's failure handling, does it match the exact fallback behavior specified above (not just "something reasonable")?
 - [ ] Did I add/update `StageTiming` capture for any new or modified stage boundary?
+- [ ] If I touched anything on the audio path, does `tests/integration/test_streaming_latency.py` still pass? (It fails if a change makes the pipeline buffer a clip.)
 - [ ] Did I add a unit test using the fakes in `backend/tests/fakes/` covering both the happy path and the fallback path (see `TESTING.md`)?
