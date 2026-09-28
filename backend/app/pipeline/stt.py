@@ -40,6 +40,7 @@ and README.md for why this matters to get right):
 """
 
 import asyncio
+import collections
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -193,134 +194,171 @@ class AssemblyAISTT:
     async def stream(
         self, audio_chunks: AsyncIterator[bytes]
     ) -> AsyncIterator[TranscriptEvent]:
-        # A bounded ring-style buffer of recently-sent audio, so that if
-        # the connection drops we can replay what the server likely
-        # hadn't finished processing yet, rather than losing it. This
-        # is a best-effort recovery, not a guarantee — AssemblyAI does
-        # not support resuming a session with prior context, so a
-        # reconnect always starts a fresh session server-side.
-        recent_audio: list[bytes] = []
-        max_buffer_bytes = int(MAX_BUFFER_SECONDS * self._bytes_per_second)
+        """
+        Owns ONE long-lived reader over the caller's audio iterator and
+        feeds an asyncio.Queue; each connection's sender reads from that
+        queue.
 
-        audio_iter = audio_chunks.__aiter__()
+        Why not iterate `audio_chunks` inside the per-connection sender
+        (which is what this used to do): cancelling a sender that is
+        suspended inside `async for chunk in audio_chunks` throws
+        CancelledError into the source async generator and CLOSES it.
+        The next connection's sender then iterated an already-finished
+        generator and got nothing -- so the first network blip
+        permanently killed the microphone feed while the session looked
+        alive (reconnected, replayed a little audio, then silence).
+        Confirmed by tests/unit/test_stt_reconnect.py.
+
+        The queue also fixes a second loss: a chunk pulled from the
+        source but not yet delivered when a connection died used to
+        vanish. Now a chunk is only removed from the pipeline once a
+        send has actually succeeded.
+        """
+        queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+        async def read_source() -> None:
+            try:
+                async for chunk in audio_chunks:
+                    await queue.put(chunk)
+            finally:
+                await queue.put(None)  # end-of-audio sentinel
+
+        reader = asyncio.create_task(read_source())
+
+        # Recently *delivered* audio, kept so a drop can replay what the
+        # server may not have finished processing. Bounded so a long
+        # outage can't grow it without limit (oldest is dropped).
+        replay: collections.deque[bytes] = collections.deque()
+        max_replay_bytes = int(MAX_BUFFER_SECONDS * self._bytes_per_second)
+        pending: bytes | None = None  # pulled from queue, not yet delivered
+        source_done = False
         delay = RECONNECT_INITIAL_DELAY_S
 
-        while True:
-            try:
-                async with websockets.connect(
-                    self._build_url(),
-                    additional_headers={"Authorization": self._api_key},
-                    max_size=None,
-                ) as ws:
-                    delay = RECONNECT_INITIAL_DELAY_S  # reset backoff on success
-
-                    # Confirm the session actually began before treating
-                    # the connection as usable.
-                    begin_raw = await ws.recv()
-                    begin_msg = json.loads(begin_raw)
-                    if begin_msg.get("type") != "Begin":
-                        raise RuntimeError(
-                            f"Expected 'Begin' message, got: {begin_msg.get('type')}"
-                        )
-                    logger.info(
-                        "assemblyai_stt: session started id=%s",
-                        begin_msg.get("id"),
-                    )
-
-                    # Replay whatever we'd buffered from a prior dropped
-                    # connection before resuming live audio.
-                    for chunk in recent_audio:
-                        await ws.send(chunk)
-                    recent_audio.clear()
-
-                    send_task = asyncio.create_task(
-                        self._pump_audio(
-                            ws, audio_iter, recent_audio, max_buffer_bytes
-                        )
-                    )
-
-                    try:
-                        async for raw in ws:
-                            try:
-                                payload = json.loads(raw)
-                            except json.JSONDecodeError:
-                                logger.warning(
-                                    "assemblyai_stt: non-JSON message, skipping"
-                                )
-                                continue
-
-                            msg_type = payload.get("type")
-                            if msg_type == "Turn":
-                                yield _parse_turn_message(payload)
-                            elif msg_type == "Termination":
-                                logger.info(
-                                    "assemblyai_stt: session terminated by server"
-                                )
-                                return
-                            elif msg_type == "Error":
-                                logger.error(
-                                    "assemblyai_stt: server error: %s",
-                                    payload.get("error"),
-                                )
-                            # "Begin" already handled above; unknown
-                            # types are ignored rather than raising, so
-                            # a future protocol addition doesn't break
-                            # this integration outright.
-                    finally:
-                        send_task.cancel()
-                        try:
-                            await send_task
-                        except asyncio.CancelledError:
-                            pass  # expected — we just cancelled it above
-                        except Exception:
-                            # A real failure in _pump_audio (as opposed
-                            # to our own cancellation) shouldn't be
-                            # silently dropped — log it, but don't let
-                            # it mask whatever caused us to reach this
-                            # `finally` in the first place.
-                            logger.warning(
-                                "assemblyai_stt: audio pump task raised "
-                                "during shutdown",
-                                exc_info=True,
+        try:
+            while True:
+                try:
+                    async with websockets.connect(
+                        self._build_url(),
+                        additional_headers={"Authorization": self._api_key},
+                        max_size=None,
+                    ) as ws:
+                        begin = json.loads(await ws.recv())
+                        if begin.get("type") != "Begin":
+                            raise RuntimeError(
+                                f"Expected 'Begin' message, got: {begin.get('type')}"
                             )
+                        delay = RECONNECT_INITIAL_DELAY_S
+                        logger.info(
+                            "assemblyai_stt: session started id=%s", begin.get("id")
+                        )
 
-                    # audio_iter exhausted with no server-side
-                    # termination — the session ended normally.
-                    return
+                        # Replay what the previous connection may not have
+                        # finished. Kept in `replay` (not cleared) so a
+                        # second drop can replay it again.
+                        for chunk in list(replay):
+                            await ws.send(chunk)
 
-            except StopAsyncIteration:
-                # Caller's audio source ended cleanly.
-                return
+                        state = {"pending": pending, "done": source_done}
+                        sender = asyncio.create_task(
+                            self._send_loop(
+                                ws, queue, state, replay, max_replay_bytes
+                            )
+                        )
+                        try:
+                            async for raw in ws:
+                                try:
+                                    payload = json.loads(raw)
+                                except json.JSONDecodeError:
+                                    logger.warning(
+                                        "assemblyai_stt: non-JSON message, skipping"
+                                    )
+                                    continue
+
+                                msg_type = payload.get("type")
+                                if msg_type == "Turn":
+                                    yield _parse_turn_message(payload)
+                                elif msg_type == "Termination":
+                                    logger.info(
+                                        "assemblyai_stt: session terminated by server"
+                                    )
+                                    return
+                                elif msg_type == "Error":
+                                    logger.error(
+                                        "assemblyai_stt: server error: %s",
+                                        payload.get("error"),
+                                    )
+                                # Unknown types are ignored so a future
+                                # protocol addition doesn't break us.
+                        finally:
+                            sender.cancel()
+                            try:
+                                await sender
+                            except asyncio.CancelledError:
+                                pass  # we just cancelled it
+                            except Exception:
+                                logger.warning(
+                                    "assemblyai_stt: sender raised during shutdown",
+                                    exc_info=True,
+                                )
+                            # Carry whatever the sender hadn't delivered
+                            # into the next connection.
+                            pending = state["pending"]
+                            source_done = state["done"]
+
+                        if source_done and pending is None and queue.empty():
+                            return  # audio ended and everything was sent
+                        raise ConnectionError("server closed the connection")
+
+                except Exception:
+                    if source_done and pending is None and queue.empty():
+                        return
+                    logger.warning(
+                        "assemblyai_stt: connection error, reconnecting in %.1fs",
+                        delay,
+                        exc_info=True,
+                    )
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, RECONNECT_MAX_DELAY_S)
+        finally:
+            reader.cancel()
+            try:
+                await reader
+            except asyncio.CancelledError:
+                pass  # we just cancelled it
             except Exception:
+                # The caller's audio source itself failed. That is a
+                # real error, not cleanup noise -- surface it.
                 logger.warning(
-                    "assemblyai_stt: connection error, reconnecting in %.1fs",
-                    delay,
-                    exc_info=True,
+                    "assemblyai_stt: audio source raised", exc_info=True
                 )
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, RECONNECT_MAX_DELAY_S)
-                # Loop back around and reconnect; recent_audio still
-                # holds whatever hadn't been confirmed sent.
-                continue
 
     @staticmethod
-    async def _pump_audio(
+    async def _send_loop(
         ws,
-        audio_iter,
-        recent_audio: list[bytes],
-        max_buffer_bytes: int,
+        queue: "asyncio.Queue[bytes | None]",
+        state: dict,
+        replay: "collections.deque[bytes]",
+        max_replay_bytes: int,
     ) -> None:
         """
-        Forwards audio chunks from the caller's async iterator to the
-        websocket as binary frames, while keeping a bounded trailing
-        buffer for reconnect replay. Runs as its own task so receiving
-        Turn messages is never blocked waiting on the next audio chunk.
+        Delivers queued audio to one connection. A chunk is held in
+        `state["pending"]` from the moment it leaves the queue until
+        `ws.send` succeeds, so if this task is cancelled or the socket
+        dies mid-send, the chunk is not lost -- stream() carries it to
+        the next connection.
         """
-        buffered_bytes = sum(len(c) for c in recent_audio)
-        async for chunk in audio_iter:
-            await ws.send(chunk)
-            recent_audio.append(chunk)
-            buffered_bytes += len(chunk)
-            while buffered_bytes > max_buffer_bytes and recent_audio:
-                dropped = recent_audio.pop(0)
-                buffered_bytes -= len(dropped)
+        while True:
+            if state["pending"] is None:
+                item = await queue.get()
+                if item is None:
+                    state["done"] = True
+                    return
+                state["pending"] = item
+            await ws.send(state["pending"])
+            chunk = state["pending"]
+            state["pending"] = None
+
+            replay.append(chunk)
+            total = sum(len(c) for c in replay)
+            while total > max_replay_bytes and replay:
+                total -= len(replay.popleft())
