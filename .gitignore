@@ -19,3 +19,6 @@ out/
 
 # OS
 .DS_Store
+
+# Frontend unit-test build output
+.test-build/
