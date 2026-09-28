@@ -15,6 +15,23 @@ from app.schemas.style_metadata import Pace, StyleMetadata, Tone
 
 logger = logging.getLogger("vernacular.tts")
 
+# The single audio contract for everything TTS emits. Every provider is
+# asked for RAW PCM16 (signed 16-bit little-endian, mono) at this rate,
+# so the frontend can schedule buffers directly with no codec
+# negotiation and no per-provider branching. This is declared to the
+# client in the wire protocol (see app/ws/session.py::audio_format()).
+#
+# Why not the providers' default MP3: an MP3 stream split at arbitrary
+# byte boundaries cannot be decoded chunk-by-chunk in the browser, and
+# the client would have no way to know the format. Both providers
+# support 24 kHz raw PCM natively (ElevenLabs `pcm_24000`; OpenAI
+# `response_format="pcm"` is defined as 24 kHz mono 16-bit LE).
+AUDIO_SAMPLE_RATE = 24000
+AUDIO_ENCODING = "pcm_s16le"
+AUDIO_CHANNELS = 1
+ELEVENLABS_OUTPUT_FORMAT = "pcm_24000"
+OPENAI_RESPONSE_FORMAT = "pcm"
+
 
 class TTSProvider(Protocol):
     async def synthesize(
@@ -173,6 +190,7 @@ class ElevenLabsTTS:
             model_id=self.MODEL_ID,
             text=text,
             voice_settings=settings.as_dict(),
+            output_format=ELEVENLABS_OUTPUT_FORMAT,
         )
         async for chunk in audio_stream:
             yield chunk
@@ -262,6 +280,7 @@ class FallbackTTS:
             voice=self.DEFAULT_VOICE,
             input=text,
             speed=speed,
+            response_format=OPENAI_RESPONSE_FORMAT,
         ) as response:
             async for chunk in response.iter_bytes():
                 yield chunk
