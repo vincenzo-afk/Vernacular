@@ -234,7 +234,7 @@ class Translator:
             )
             return TranslationResult(
                 translated_text=source_text,
-                style=StyleMetadata.neutral_fallback(),
+                style=_carry_measured(StyleMetadata.neutral_fallback(), source_style),
                 was_literal_fallback=True,
             )
 
