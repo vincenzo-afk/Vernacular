@@ -154,7 +154,7 @@ class Translator:
 
         try:
             return await asyncio.wait_for(
-                self._call_llm(source_text, source_style, target_language),
+                self._call_llm(source_text, source_style, target_language, context),
                 timeout=FIRST_CALL_TIMEOUT_S,
             )
         except Exception:
@@ -165,7 +165,7 @@ class Translator:
 
         try:
             return await asyncio.wait_for(
-                self._call_llm(source_text, source_style, target_language),
+                self._call_llm(source_text, source_style, target_language, context),
                 timeout=RETRY_TIMEOUT_S,
             )
         except Exception:
