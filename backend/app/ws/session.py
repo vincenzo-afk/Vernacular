@@ -215,8 +215,11 @@ async def handle_session(websocket: WebSocket, target_language: str) -> None:
 
     llm_client = _build_llm_client(settings)
     stt = AssemblyAISTT(api_key=settings.assemblyai_api_key)
-    register_detector = RegisterDetector(llm_client=llm_client)
+    register_detector = RegisterDetector(
+        llm_client=llm_client, explain=settings.register_explain
+    )
     translator = Translator(llm_client=llm_client)
+    summarizer = ConversationSummarizer(llm_client=llm_client)
 
     tts = ElevenLabsTTS(api_key=settings.elevenlabs_api_key)
     fallback_tts = None
@@ -245,40 +248,160 @@ async def handle_session(websocket: WebSocket, target_language: str) -> None:
         target_language=target_language,
         voice_id="default",  # TODO: voice cloning calibration step, gated
         # on explicit consent — see CONTRIBUTING.md "Known gaps"
+        emit_captions=True,
     )
 
-    await run_session(websocket, orchestrator)
+    await run_session(
+        websocket,
+        orchestrator,
+        summarizer=summarizer,
+        target_language=target_language,
+    )
 
 
-async def run_session(websocket: WebSocket, orchestrator: SessionOrchestrator) -> None:
+class _Sender:
+    """
+    Serializes sends on one websocket (the audio loop, the control
+    reader and summary tasks all send) and feeds each send's duration
+    to the adaptive controller: `send` only stalls when the client's
+    receive path is backed up, which makes it a genuine congestion
+    signal that needs no client cooperation.
+    """
+
+    def __init__(self, websocket: WebSocket, controller: AdaptiveController) -> None:
+        self._ws = websocket
+        self._controller = controller
+        self._lock = asyncio.Lock()
+
+    async def text(self, payload: dict) -> None:
+        changed = await self._send(self._ws.send_text, json.dumps(payload))
+        if changed:
+            await self.announce_tier()
+
+    async def data(self, payload: bytes) -> None:
+        changed = await self._send(self._ws.send_bytes, payload)
+        if changed:
+            await self.announce_tier()
+
+    async def announce_tier(self) -> None:
+        # Raw send: announcing a tier change must not feed the
+        # controller that just changed tier.
+        async with self._lock:
+            await self._ws.send_text(json.dumps(network_to_wire(self._controller)))
+
+    async def _send(self, fn, arg) -> bool:
+        async with self._lock:
+            start = time.monotonic()
+            await fn(arg)
+            elapsed_ms = (time.monotonic() - start) * 1000
+        return self._controller.observe_send(elapsed_ms)
+
+
+async def run_session(
+    websocket: WebSocket,
+    orchestrator: SessionOrchestrator,
+    summarizer: ConversationSummarizer | None = None,
+    target_language: str | None = None,
+) -> None:
     """
     The wire-protocol half of a session, separated from provider
     construction (handle_session) so it can be exercised end-to-end
     with fake providers over a real socket -- see
     tests/integration/test_ws_roundtrip.py.
 
-    Sends the `ready` message first, then streams `segment` messages
-    each followed by that segment's binary audio frames.
+    Sends the `ready` message first, then streams `caption` messages
+    (if the orchestrator emits them) and `segment` messages each
+    followed by that segment's binary audio frames. Adapts framing to
+    the network tier (app/adaptive.py) and answers client control
+    messages (network report, ping, summarize).
     """
+    controller = AdaptiveController()
+    sender = _Sender(websocket, controller)
+    throttle = CaptionThrottle()
+    coalescer = AudioCoalescer()
+    background: set[asyncio.Task] = set()
+
     await websocket.send_text(json.dumps(ready_to_wire()))
+
+    async def send_summary(language: str) -> None:
+        try:
+            if summarizer is None:
+                summary = extractive_summary(orchestrator.memory)
+            else:
+                summary = await summarizer.summarize(
+                    orchestrator.memory,
+                    target_language=target_language if language == "target" else None,
+                )
+            await sender.text(summary_to_wire(summary))
+        except Exception:
+            logger.exception("ws.session: summary request failed")
+
+    async def handle_control(text: str) -> None:
+        try:
+            message = json.loads(text)
+        except json.JSONDecodeError:
+            logger.debug("ws.session: ignoring non-JSON control frame")
+            return
+        if not isinstance(message, dict):
+            return
+        kind = message.get("type")
+        if kind == "network":
+            report = parse_network_report(message)
+            if report is None:
+                logger.debug("ws.session: ignoring malformed network report")
+            elif controller.report_client(*report):
+                await sender.announce_tier()
+        elif kind == "ping":
+            await sender.text({"type": "pong", "id": message.get("id")})
+        elif kind == "summarize":
+            language = "source" if message.get("language") == "source" else "target"
+            # Off the audio path: an LLM call must never block mic intake.
+            task = asyncio.create_task(send_summary(language))
+            background.add(task)
+            task.add_done_callback(background.discard)
+        else:
+            logger.debug("ws.session: ignoring unknown control message %r", kind)
 
     async def audio_in():
         while True:
-            chunk = await websocket.receive_bytes()
-            yield chunk
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                raise WebSocketDisconnect(message.get("code", 1000))
+            if message.get("bytes") is not None:
+                yield message["bytes"]
+            elif message.get("text") is not None:
+                await handle_control(message["text"])
 
     try:
         # Stream, don't buffer: each audio frame is forwarded the
         # moment the TTS provider emits it, so the listener hears the
         # start of a sentence while the rest is still being
         # synthesized (CLAUDE.md constraint #2, ARCHITECTURE.md §3).
+        # On a degraded link small frames are coalesced (never a whole
+        # clip; flushed at every segment boundary).
         async for event in orchestrator.run_stream(audio_in()):
-            if isinstance(event, SegmentStart):
-                await websocket.send_text(json.dumps(segment_start_to_wire(event)))
+            policy = controller.policy
+            if isinstance(event, CaptionEvent):
+                if throttle.allow(
+                    time.monotonic() * 1000, event.is_final, policy.caption_min_interval_ms
+                ):
+                    await sender.text(caption_to_wire(event))
+            elif isinstance(event, SegmentStart):
+                leftover = coalescer.flush()
+                if leftover:
+                    await sender.data(leftover)
+                await sender.text(segment_start_to_wire(event))
             elif isinstance(event, AudioChunk):
-                await websocket.send_bytes(event.data)
-            # SegmentEnd needs no wire message: the next `segment`
-            # JSON (or session end) delimits the audio frames.
+                frame = coalescer.push(event.data, policy.audio_coalesce_bytes)
+                if frame:
+                    await sender.data(frame)
+            elif isinstance(event, SegmentEnd):
+                frame = coalescer.flush()
+                if frame:
+                    await sender.data(frame)
+        frame = coalescer.flush()
+        if frame:
+            await sender.data(frame)
     except WebSocketDisconnect:
         logger.info("ws.session: client disconnected")
     except Exception:
