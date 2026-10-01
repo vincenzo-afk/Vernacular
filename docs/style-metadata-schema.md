@@ -56,6 +56,30 @@ This is the full reference for `StyleMetadata`, the structured contract that car
 **Source:** The register detector's self-reported confidence in the overall reading
 **Consumed by:** Orchestrator — below a configured threshold, the pipeline falls back to a neutral-register default rather than acting on a low-confidence read (see `ARCHITECTURE.md` §5)
 
+### Multimodal and explanatory fields
+
+These extend the eight register fields above. All are optional/defaulted, so code that builds a `StyleMetadata` without them still works. Unlike the eight register fields they are **not** rewritten by the translator — they describe the speaker's delivery, not the target-language text — and the translator prompt does not contain them (`StyleMetadata.register_dict()` is what the LLM stages see). The translator carries them through to its output unchanged.
+
+### `acoustic`
+**Type:** object or `null` — `arousal_score`, `energy_db`, `energy_delta_db`, `energy_variability_db`, `pitch_mean_hz`, `pitch_delta_pct`, `pitch_range_hz`, `voiced_ratio`, `duration_ms`
+**Source:** measured from the raw mic audio by `pipeline/prosody.py` (loudness and pitch of voiced frames), reported relative to the speaker's own running baseline. `null` when too little speech was heard. **Never accepted from the LLM.**
+**Consumed by:** register detection (as an `Acoustic:` line in the prompt), `arousal`/`modality_conflict` fusion, the explanation's measured cues, key-moment scoring, the UI.
+
+### `arousal`
+**Type:** enum — `low | medium | high`
+**Source:** `acoustic.arousal_score` thresholded (below 0.35 / above 0.65). Defaults to `medium` when there is no audio measurement. A transparent heuristic (louder / higher / more varied than this speaker's norm), validated only on synthetic signals — not a trained emotion model.
+**Consumed by:** key-moment scoring, the UI's "voice energy" tag.
+
+### `modality_conflict`
+**Type:** bool
+**Source:** `pipeline/prosody.py::fuse_modalities` — true when the wording implies high energy or warmth (urgent/excited/annoyed, or positive emotion) but the voice is quiet and flat (arousal < 0.30 over at least 300 ms of speech). It is a signal, not a verdict: deadpan delivery is a classic sarcasm cue but can also just be a calm speaker.
+**Consumed by:** key-moment scoring, the UI's "words ≠ voice" tag, and the explanation.
+
+### `explanation`
+**Type:** object or `null` — `summary` (one sentence), `cues[]` (`kind`, `evidence`, `weight`, `source`), `context_used`
+**Source:** `cues` with `source: "llm"` are the register-detection model's own account and are **unverified**; cues with `source: "measured"` are computed deterministically from the audio and word timings. `kind` is one of `lexical | prosodic | acoustic | contextual | incongruence`. A `contextual` cue and `context_used: true` are discarded unless earlier turns were actually supplied to the model. The UI keeps the two sources visually distinct.
+**Consumed by:** the "Why this tone?" panel only — nothing downstream depends on it.
+
 ---
 
 ## Example: sarcastic remark
@@ -110,6 +134,44 @@ Source utterance, ambiguous/short: *"Understood."*
 ```
 
 This last example is short enough that the detector can't be confident — `confidence: 0.35` would fall below the fallback threshold in most configurations, so the orchestrator would treat this as neutral register regardless of the specific field values above.
+
+## Example: context-aware, multimodal, explained reading
+
+Source utterance: *"Oh, great."* said right after *"The build failed again."*, quietly and flatly.
+
+```json
+{
+  "tone": "sarcastic",
+  "pace": "slow",
+  "formality": "casual",
+  "emotion": "frustration",
+  "sarcasm_score": 0.9,
+  "emphasis_words": ["great"],
+  "pause_pattern": "dramatic",
+  "confidence": 0.86,
+  "arousal": "low",
+  "acoustic": {
+    "arousal_score": 0.22,
+    "energy_db": -31.0,
+    "energy_delta_db": -6.0,
+    "energy_variability_db": 2.1,
+    "pitch_mean_hz": 142.0,
+    "pitch_delta_pct": -4.0,
+    "pitch_range_hz": 9.0,
+    "voiced_ratio": 0.7,
+    "duration_ms": 900
+  },
+  "modality_conflict": false,
+  "explanation": {
+    "summary": "Praise right after a failure, said quietly and flat: sarcasm.",
+    "cues": [
+      {"kind": "contextual", "evidence": "follows 'The build failed again.'", "weight": 0.9, "source": "llm"},
+      {"kind": "acoustic", "evidence": "voice 6 dB quieter than this speaker's usual", "weight": 0.7, "source": "measured"}
+    ],
+    "context_used": true
+  }
+}
+```
 
 ---
 
