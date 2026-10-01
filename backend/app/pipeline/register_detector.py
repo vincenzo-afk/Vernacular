@@ -393,27 +393,92 @@ class RegisterDetector:
                 result.confidence,
                 self.CONFIDENCE_THRESHOLD,
             )
-            return StyleMetadata.neutral_fallback()
+            return fuse_modalities(
+                StyleMetadata.neutral_fallback(), acoustic, transcript.words
+            )
 
-        return result
+        return fuse_modalities(result, acoustic, transcript.words)
 
-    async def _call_llm(self, transcript: TranscriptEvent) -> StyleMetadata:
-        user_prompt = _build_user_prompt(transcript)
+    async def _call_llm(
+        self,
+        transcript: TranscriptEvent,
+        context: str | None = None,
+        acoustic: AcousticFeatures | None = None,
+    ) -> StyleMetadata:
+        user_prompt = _build_user_prompt(
+            transcript, context=context, acoustic=acoustic, explain=self._explain
+        )
         raw = await self._llm_client.complete(
-            system=SYSTEM_PROMPT,
+            system=self._system_prompt,
             user=user_prompt,
             temperature=0.2,
-            max_tokens=300,
+            max_tokens=self.MAX_TOKENS_EXPLAIN if self._explain else self.MAX_TOKENS,
         )
-        return self._parse_response(raw)
+        return self._parse_response(
+            raw, context_supplied=bool(context and context.strip())
+        )
 
     @staticmethod
-    def _parse_response(raw: str) -> StyleMetadata:
+    def _parse_response(raw: str, context_supplied: bool = False) -> StyleMetadata:
         """
         Parses the LLM's JSON output into StyleMetadata. Strips common
         wrapping (markdown code fences) defensively, since not every
         model reliably honors "output only JSON" instructions.
+
+        The measured fields (`acoustic`, `arousal`, `modality_conflict`)
+        are never accepted from the model -- only the pipeline sets
+        them. The explanation is parsed leniently: a malformed one is
+        dropped, it never invalidates an otherwise good register reading.
         """
         text = strip_markdown_fence(raw)
         data = json.loads(text)
-        return StyleMetadata(**data)
+        raw_explanation = data.pop("explanation", None)
+        for measured in ("acoustic", "arousal", "modality_conflict"):
+            data.pop(measured, None)
+        style = StyleMetadata(**data)
+        explanation = _parse_explanation(raw_explanation, context_supplied)
+        if explanation is not None:
+            style = style.model_copy(update={"explanation": explanation})
+        return style
+
+
+def _parse_explanation(raw: object, context_supplied: bool) -> StyleExplanation | None:
+    if not isinstance(raw, dict):
+        return None
+    summary = raw.get("summary")
+    summary = _clip(summary, 160) if isinstance(summary, str) else ""
+
+    cues: list[Cue] = []
+    raw_cues = raw.get("cues")
+    for item in raw_cues[:4] if isinstance(raw_cues, list) else []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            kind = CueKind(item.get("kind"))
+        except ValueError:
+            continue
+        # A model cannot have used context it was never given.
+        if kind == CueKind.CONTEXTUAL and not context_supplied:
+            continue
+        evidence = item.get("evidence")
+        if not isinstance(evidence, str) or not evidence.strip():
+            continue
+        weight = item.get("weight", 0.5)
+        if isinstance(weight, bool) or not isinstance(weight, (int, float)):
+            weight = 0.5
+        cues.append(
+            Cue(
+                kind=kind,
+                evidence=_clip(evidence, 140),
+                weight=min(1.0, max(0.0, float(weight))),
+                source=CueSource.LLM,  # always: the model's account, unverified
+            )
+        )
+
+    if not summary and not cues:
+        return None
+    return StyleExplanation(
+        summary=summary,
+        cues=cues,
+        context_used=bool(raw.get("context_used")) and context_supplied,
+    )
