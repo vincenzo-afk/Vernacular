@@ -423,14 +423,47 @@ export default function Home() {
         </p>
       )}
 
+      {tier !== "good" && isLive && (
+        <p
+          role="status"
+          className="rounded bg-neutral-800 px-3 py-1 text-xs text-neutral-300 max-w-md text-center"
+        >
+          Slow connection detected — captions are updating less often and
+          audio is sent in larger pieces. Nothing is being dropped.
+        </p>
+      )}
+
       {isLive && <Waveform />}
 
-      <ToneTags tag={styleTag} />
+      <LatencyHud
+        summary={latency}
+        rttMs={rttMs}
+        tier={tier}
+        serverSendMs={serverSendMs}
+      />
 
       <LiveTranscript
-        sourceText={sourceText}
-        translatedText={translatedText}
-        isFinal={true}
+        live={live}
+        segments={segments}
+        view={view}
+        onViewChange={setView}
+        keyOnly={keyOnly}
+        onKeyOnlyChange={setKeyOnly}
+      />
+
+      <SummaryPanel
+        summary={summary}
+        pending={summaryPending}
+        disabled={!isLive || segments.length === 0}
+        onRequest={requestSummary}
+      />
+
+      <ExportMenu
+        segments={exportSegments}
+        targetLanguage={sessionLanguage}
+        getAudio={getAudio}
+        audioFormat={audioFormat}
+        audioTruncated={audioTruncated}
       />
     </main>
   );
