@@ -1,11 +1,25 @@
 "use client";
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Waveform from "@/components/Waveform";
-import LiveTranscript from "@/components/LiveTranscript";
-import ToneTags from "@/components/ToneTags";
-import { VernacularSession, type StyleTag } from "@/lib/ws-client";
+import LiveTranscript, {
+  type LiveCaption,
+  type TranscriptView,
+} from "@/components/LiveTranscript";
+import LatencyHud from "@/components/LatencyHud";
+import SummaryPanel from "@/components/SummaryPanel";
+import ExportMenu from "@/components/ExportMenu";
+import {
+  VernacularSession,
+  type AudioFormat,
+  type NetworkTier,
+  type SegmentMessage,
+  type SummaryMessage,
+} from "@/lib/ws-client";
 import { PcmPlayer } from "@/lib/player";
+import { MAX_AUDIO_BYTES, concatChunks, toExportSegment } from "@/lib/export";
+import { RttProbe, summarizeLatency } from "@/lib/latency";
+import { TierTracker, classifyNetwork, readConnectionInfo } from "@/lib/network";
 
 /**
  * Main demo UI. Captures mic audio as raw PCM16 frames (matching what
@@ -24,6 +38,13 @@ import { PcmPlayer } from "@/lib/player";
 
 const TARGET_SAMPLE_RATE = 16000; // must match AssemblyAISTT's default
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:8000";
+
+// Network probe cadence (lib/network.ts, backend/app/adaptive.py).
+const PROBE_INTERVAL_MS = 2000;
+// A ping unanswered this long counts as a very high RTT: a lost pong
+// is itself evidence of a bad link.
+const LOST_PONG_MS = 3000;
+const SUMMARY_TIMEOUT_MS = 15000;
 
 type ConnectionState = "idle" | "connecting" | "live" | "error";
 
