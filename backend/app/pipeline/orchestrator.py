@@ -644,6 +644,18 @@ class SessionOrchestrator:
             )
             return
 
+        # Key moment from the SOURCE reading, compared with the previous
+        # turn's. Deterministic and LLM-free: adds no latency.
+        key_moment = detect_key_moment(style, self._memory.previous_style(segment_id))
+        self._memory.complete_turn(
+            segment_id,
+            translation.translated_text,
+            style,
+            key_moment=key_moment,
+            speech_start_ms=job.audio.speech_start_ms if job else None,
+            speech_end_ms=job.audio.speech_end_ms if job else None,
+        )
+
         tts_start = time.monotonic() * 1000
         first_byte_recorded = False
         started = False
