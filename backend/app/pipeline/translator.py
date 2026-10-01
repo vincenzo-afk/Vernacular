@@ -178,16 +178,24 @@ class Translator:
             )
 
     async def _call_llm(
-        self, source_text: str, source_style: StyleMetadata, target_language: str
+        self,
+        source_text: str,
+        source_style: StyleMetadata,
+        target_language: str,
+        context: str | None = None,
     ) -> TranslationResult:
-        user_prompt = _build_user_prompt(source_text, source_style, target_language)
+        user_prompt = _build_user_prompt(
+            source_text, source_style, target_language, context
+        )
         raw = await self._llm_client.complete(
             system=SYSTEM_PROMPT,
             user=user_prompt,
             temperature=0.3,
             max_tokens=500,
         )
-        return self._parse_response(raw)
+        result = self._parse_response(raw)
+        result.style = _carry_measured(result.style, source_style)
+        return result
 
     async def _literal_fallback(
         self, source_text: str, source_style: StyleMetadata, target_language: str
@@ -216,7 +224,7 @@ class Translator:
             )
             return TranslationResult(
                 translated_text=strip_markdown_fence(raw),
-                style=StyleMetadata.neutral_fallback(),
+                style=_carry_measured(StyleMetadata.neutral_fallback(), source_style),
                 was_literal_fallback=True,
             )
         except Exception:
