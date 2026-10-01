@@ -259,6 +259,10 @@ class SessionOrchestrator:
         self.timings: list[StageTiming] = []
         self._segment_counter = 0
 
+    @property
+    def memory(self) -> ConversationMemory:
+        return self._memory
+
     async def run(
         self, audio_chunks: AsyncIterator[bytes]
     ) -> AsyncIterator[SegmentOutput]:
