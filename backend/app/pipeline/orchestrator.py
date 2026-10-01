@@ -134,6 +134,16 @@ class SegmentOutput:
     # frontend so degraded fidelity is never presented as full quality
     # -- see ARCHITECTURE.md §5.
     degraded: bool = False
+    segment_id: int = 0
+    key_moment: KeyMoment = field(default_factory=KeyMoment)
+    timings: SegmentTimings = field(default_factory=SegmentTimings)
+    # Where the utterance sits on the mic stream's own clock (ms since
+    # the first sample), from the voice-activity gate in prosody.py.
+    # None when no speech was detected. Drives subtitle timing.
+    speech_start_ms: int | None = None
+    speech_end_ms: int | None = None
+    # How many earlier turns were fed to the LLM stages as context.
+    context_turns: int = 0
 
 
 @dataclass
