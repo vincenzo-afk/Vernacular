@@ -15,19 +15,45 @@ the concurrency model this implements:
   never kills the session.
 - Every stage transition is timed via StageTiming for latency
   visibility (there is no automated latency test — see TESTING.md).
+
+Concurrency layout of run_stream (why captions no longer stall):
+
+    mic audio ──tap──▶ ProsodyAnalyzer (voice features, inline, ~0.5% CPU)
+        │
+        ▼
+    [pump task]  consumes STT events the moment they arrive:
+        partial ─▶ CaptionEvent + speculative register detection
+        final   ─▶ CaptionEvent + a job on the work queue
+        │ work queue
+        ▼
+    [worker task] one job at a time (segments stay ordered):
+        resolve style ─▶ translate ─▶ TTS stream ─▶ output queue
+        │ output queue
+        ▼
+    run_stream() yields events to the WebSocket
+
+Previously segments were processed inline inside the STT loop, so while
+a segment was being translated and spoken the next utterance's partial
+transcripts sat unread -- fatal for live captions. The pump never waits
+on a segment, so captions stay live while audio plays. The cost: a
+segment now records how long it waited behind the previous one
+(`SegmentTimings.queue_wait_ms`) so backlog is visible instead of hidden.
 """
 
 import asyncio
 import logging
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from app.conversation import ConversationMemory
+from app.insights import KeyMoment, detect_key_moment
+from app.pipeline.prosody import ProsodyAnalyzer, UtteranceAudio, fuse_modalities
 from app.pipeline.register_detector import RegisterDetector
 from app.pipeline.stt import STTProvider, TranscriptEvent
 from app.pipeline.translator import Translator
 from app.pipeline.tts import TTSProvider
-from app.schemas.style_metadata import StyleMetadata
+from app.schemas.style_metadata import AcousticFeatures, StyleMetadata
 
 logger = logging.getLogger("vernacular.orchestrator")
 
