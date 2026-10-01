@@ -93,6 +93,17 @@ Target: **~2 seconds end-to-end**, from the speaker finishing a phrase to transl
 2. **Streaming on the output side.** TTS audio is forwarded to the client frame-by-frame as the provider emits it (`run_stream()`), and `tts_first_byte` is timed separately from total synthesis. `tests/integration/test_streaming_latency.py` fails if a change makes the pipeline buffer a clip.
 3. **Bounded stages.** Register detection has a 1.5s timeout and translation has 3.0s/1.5s, so one slow provider can degrade fidelity but cannot freeze the session.
 
+**Latency accounting for the feature layer (§7).** Every addition that touches the hot path, and where the budget absorbs it. None of these numbers has been measured against live providers — the first two are reasoned estimates, the third was measured offline:
+
+| Addition | Where it lands | Cost |
+|---|---|---|
+| Conversation context in the detection + translation prompts | Input tokens on two existing LLM calls | Capped at 600 chars (~150 tokens) per call — small next to the few-shot block already in the detection prompt. Not measured live. |
+| Explanation field in the detection output | Output tokens on the register-detection call | ~60–100 extra output tokens. This is real generation time in a stage budgeted at ~400 ms, but detection is speculative (usually hidden behind STT finalization). `REGISTER_EXPLAIN=false` removes it. **Must be checked with `python -m app.benchmark --live`.** |
+| Acoustic analysis (`pipeline/prosody.py`) | Inline in the audio tap, per mic chunk | Pure Python, ~0.5% of real time on the dev sandbox (≈44 ms of CPU per 10 s of audio, i.e. ~0.6 ms per 128 ms chunk). It is synchronous CPU work in the event loop rather than I/O, so the "no blocking calls" rule is met in spirit: it is bounded, and a test fails if it exceeds 20% of real time. |
+| STT pump / worker split (orchestrator) | Structure only | Adds no latency to a single utterance. It stops a segment's translation/TTS from blocking the reading of the *next* utterance's partials. Cost: a segment can now wait behind the previous one; that wait is reported as `queue_wait_ms` instead of being hidden. |
+| Adaptive audio coalescing (POOR/FAIR network only) | Output side | Up to one coalesce window (100 ms FAIR / 200 ms POOR) of extra delay on the *first* frame, only on degraded links, never a whole clip; flushed at every segment end. Off on a good link. |
+| Key-moment detection, memory, HUD timings | — | Deterministic arithmetic on data already in hand; no I/O, no LLM. |
+
 **Not yet built (do not assume these exist):**
 
 - **Streaming translation → TTS.** Translation is a single blocking `complete()`; TTS starts only after the whole translation returns. Moving to clause-level streaming is the largest remaining latency win but is not a small change: the translator's output is one JSON object containing both `translated_text` and the refined `style`, and JSON cannot be consumed until it closes. It would need a different output shape (e.g. a style header line first, then plain text streamed), which touches the prompt, both LLM adapters, the parser and the retry/fallback path — and its effect on translation quality can only be judged against a live model. Scope it as its own change with a live evaluation.
