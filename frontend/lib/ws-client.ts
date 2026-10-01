@@ -23,6 +23,12 @@
  *
  *   Or, on an unrecoverable session error:
  *     {"type": "error", "message": "session_failed"}
+ *
+ * Also: `caption` (live source-language transcript), `network` (the
+ * server's adaptive-streaming tier changed), `pong` (reply to a
+ * latency probe) and `summary` (reply to a summarize request). Client
+ * -> server control messages: `network`, `ping`, `summarize` (see
+ * backend/app/ws/session.py for the authoritative description).
  */
 
 /** Declared by the server in the `ready` message; describes every
@@ -37,6 +43,41 @@ export interface AudioFormat {
 export interface ReadyMessage {
   type: "ready";
   audio: AudioFormat;
+}
+
+export interface AcousticTag {
+  arousal_score: number;
+  energy_db: number;
+  energy_delta_db: number;
+  energy_variability_db: number;
+  pitch_mean_hz: number | null;
+  pitch_delta_pct: number | null;
+  pitch_range_hz: number | null;
+  voiced_ratio: number;
+  duration_ms: number;
+}
+
+export type CueKind =
+  | "lexical"
+  | "prosodic"
+  | "acoustic"
+  | "contextual"
+  | "incongruence";
+
+export interface CueTag {
+  kind: CueKind;
+  evidence: string;
+  weight: number;
+  /** "llm" = the model's own (unverified) account; "measured" =
+   * computed from the audio / word timings and checkable. The UI keeps
+   * the two visually distinct. */
+  source: "llm" | "measured";
+}
+
+export interface ExplanationTag {
+  summary: string;
+  cues: CueTag[];
+  context_used: boolean;
 }
 
 export interface StyleTag {
