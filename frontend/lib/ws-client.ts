@@ -166,16 +166,31 @@ export interface ErrorMessage {
   message: string;
 }
 
-type ControlMessage = ReadyMessage | SegmentMessage | ErrorMessage;
+type ControlMessage =
+  | ReadyMessage
+  | SegmentMessage
+  | CaptionMessage
+  | NetworkMessage
+  | PongMessage
+  | SummaryMessage
+  | ErrorMessage;
+
+const CONTROL_TYPES = new Set([
+  "ready",
+  "segment",
+  "caption",
+  "network",
+  "pong",
+  "summary",
+  "error",
+]);
 
 function isControlMessage(value: unknown): value is ControlMessage {
   return (
     typeof value === "object" &&
     value !== null &&
     "type" in value &&
-    ((value as { type: unknown }).type === "ready" ||
-      (value as { type: unknown }).type === "segment" ||
-      (value as { type: unknown }).type === "error")
+    CONTROL_TYPES.has((value as { type: string }).type)
   );
 }
 
@@ -185,6 +200,11 @@ export interface VernacularSessionOptions {
   onAudioChunk: (chunk: ArrayBuffer) => void;
   onReady?: (audio: AudioFormat) => void;
   onSegment?: (segment: SegmentMessage) => void;
+  onCaption?: (caption: CaptionMessage) => void;
+  onNetwork?: (network: NetworkMessage) => void;
+  onPong?: (pong: PongMessage) => void;
+  onSummary?: (summary: SummaryMessage) => void;
+  onClose?: () => void;
   onError?: (message: string) => void;
   /** Fired if a message from the server doesn't match the expected
    * shape — indicates the frontend/backend wire format has drifted;
