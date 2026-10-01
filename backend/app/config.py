@@ -28,6 +28,12 @@ class Settings(BaseSettings):
 
     register_confidence_threshold: float = 0.5
 
+    # Ask the register detector to also explain its reading (powers the
+    # explainable tone/sarcasm UI). Costs ~60-100 extra output tokens
+    # per detection; set REGISTER_EXPLAIN=false if a live latency
+    # benchmark shows the detection stage over budget.
+    register_explain: bool = True
+
     # Only used by `python -m app.benchmark --live`. Optional so normal
     # operation needs no extra config; the benchmark fails with a clear
     # message if it is unset (see app/benchmark.py).
