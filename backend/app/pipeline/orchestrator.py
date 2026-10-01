@@ -228,6 +228,10 @@ class SessionOrchestrator:
         target_language: str,
         voice_id: str,
         fallback_tts: TTSProvider | None = None,
+        memory: ConversationMemory | None = None,
+        prosody: ProsodyAnalyzer | None = None,
+        emit_captions: bool = False,
+        use_context: bool = True,
     ) -> None:
         self._stt = stt
         self._register_detector = register_detector
