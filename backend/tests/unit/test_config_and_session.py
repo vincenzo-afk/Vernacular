@@ -85,18 +85,22 @@ def test_build_llm_client_raises_for_unknown_provider():
         _build_llm_client(settings)
 
 
-def test_build_llm_client_openai_requires_openai_package_installed():
+def test_build_llm_client_openai_import_boundary(monkeypatch):
     """
-    This environment (see TESTING.md) deliberately doesn't install
-    live provider SDKs for the offline test suite. Constructing the
-    OpenAI adapter should therefore raise ModuleNotFoundError here --
-    which is expected and confirms _build_llm_client actually attempts
-    a real SDK import rather than silently no-op'ing. If `openai` ever
-    becomes an offline-test dependency, this test should be updated to
-    assert against a fake client the way tests/unit/test_fallback_tts.py
-    does for FallbackTTS.
+    Simulate an unavailable live SDK explicitly so this remains
+    deterministic whether optional provider packages are installed.
+    The contract is that adapter creation crosses the real import
+    boundary rather than silently no-op'ing.
     """
     settings = _FakeSettings(llm_provider="openai")
+    real_import = __import__
+
+    def blocked_openai_import(name, *args, **kwargs):
+        if name == "openai":
+            raise ModuleNotFoundError("simulated optional dependency")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", blocked_openai_import)
     with pytest.raises(ModuleNotFoundError):
         _build_llm_client(settings)
 
