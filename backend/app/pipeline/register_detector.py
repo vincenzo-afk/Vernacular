@@ -24,8 +24,16 @@ import json
 import logging
 
 from app.pipeline.llm_response_utils import strip_markdown_fence
+from app.pipeline.prosody import describe_acoustic, fuse_modalities
 from app.pipeline.stt import TranscriptEvent
-from app.schemas.style_metadata import StyleMetadata
+from app.schemas.style_metadata import (
+    AcousticFeatures,
+    Cue,
+    CueKind,
+    CueSource,
+    StyleExplanation,
+    StyleMetadata,
+)
 
 logger = logging.getLogger("vernacular.register_detector")
 
@@ -36,11 +44,7 @@ logger = logging.getLogger("vernacular.register_detector")
 LLMClient = object
 
 
-SYSTEM_PROMPT = """\
-You are a register-detection system for a real-time speech translator. \
-Given a transcript segment and prosody signals (pace, pauses, sentiment \
-from the speech recognizer), classify the speaker's register.
-
+_OUTPUT_SPEC = """\
 Output ONLY a single JSON object with exactly these fields, no other text:
 
 {
