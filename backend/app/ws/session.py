@@ -17,27 +17,57 @@ declaring the format of every binary frame that follows. Then one JSON
 text message per completed segment, followed by binary audio-chunk
 messages for that segment:
 
-    {"type": "segment", "source_text": "...", "translated_text": "...",
-     "style": {...StyleMetadata fields...}, "degraded": false}
+    {"type": "segment", "segment_id": 1, "source_text": "...",
+     "translated_text": "...", "style": {...StyleMetadata fields...},
+     "degraded": false, "key_moment": {...}, "timings": {...},
+     "speech_start_ms": 120, "speech_end_ms": 1900, "context_turns": 2}
     <binary audio chunk>
     <binary audio chunk>
     ...
+
+Other backend -> frontend messages (all JSON text):
+
+    {"type": "caption", "text": "...", "is_final": false, "segment_id": null}
+        live source-language caption; finals carry the segment_id the
+        segment message will use, and arrive BEFORE translation is done.
+    {"type": "network", "tier": "good|fair|poor", "send_latency_ms": 12.0,
+     "client_rtt_ms": 40.0}      -- the adaptive-streaming tier changed
+    {"type": "pong", "id": "..."}     -- reply to a client ping (RTT probe)
+    {"type": "summary", ...}          -- reply to a client summarize request
+
+Frontend -> backend: binary frames are mic audio (PCM16 16 kHz mono);
+JSON text frames are control messages:
+
+    {"type": "network", "tier": "good|fair|poor", "rtt_ms": 80}
+    {"type": "ping", "id": "..."}
+    {"type": "summarize", "language": "target" | "source"}
 """
 
+import asyncio
 import json
 import logging
+import time
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from app.adaptive import (
+    AdaptiveController,
+    AudioCoalescer,
+    CaptionThrottle,
+    parse_network_report,
+)
 from app.config import get_settings
 from app.pipeline.orchestrator import (
     AudioChunk,
+    CaptionEvent,
+    SegmentEnd,
     SegmentOutput,
     SegmentStart,
     SessionOrchestrator,
 )
 from app.pipeline.register_detector import RegisterDetector
 from app.pipeline.stt import AssemblyAISTT
+from app.pipeline.summarizer import ConversationSummarizer, extractive_summary
 from app.pipeline.translator import Translator
 from app.pipeline.tts import (
     AUDIO_CHANNELS,
@@ -80,11 +110,43 @@ def segment_start_to_wire(segment: SegmentStart | SegmentOutput) -> dict:
     """
     return {
         "type": "segment",
+        "segment_id": segment.segment_id,
         "source_text": segment.source_text,
         "translated_text": segment.translated_text,
         "style": segment.style.model_dump(mode="json"),
         "degraded": segment.degraded,
+        "key_moment": segment.key_moment.model_dump(mode="json"),
+        "timings": segment.timings.to_wire(),
+        "speech_start_ms": segment.speech_start_ms,
+        "speech_end_ms": segment.speech_end_ms,
+        "context_turns": segment.context_turns,
     }
+
+
+def caption_to_wire(event: CaptionEvent) -> dict:
+    """Live caption message. Mirrors `CaptionMessage` in ws-client.ts."""
+    return {
+        "type": "caption",
+        "text": event.text,
+        "is_final": event.is_final,
+        "segment_id": event.segment_id,
+    }
+
+
+def network_to_wire(controller: AdaptiveController) -> dict:
+    """Mirrors `NetworkMessage` in ws-client.ts."""
+    send = controller.send_latency_ms
+    return {
+        "type": "network",
+        "tier": controller.policy.tier.value,
+        "send_latency_ms": None if send is None else round(send, 1),
+        "client_rtt_ms": controller.client_rtt_ms,
+    }
+
+
+def summary_to_wire(summary) -> dict:
+    """Mirrors `SummaryMessage` in ws-client.ts."""
+    return {"type": "summary", **summary.to_wire()}
 
 
 # Backwards-compatible name used by the wire-contract tests.
