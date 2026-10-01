@@ -57,6 +57,10 @@ Speaker output (translated audio in ~2s end-to-end)
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for the full data flow, module boundaries, and latency budget breakdown.
 
+### Features on top of the core pipeline
+
+Live captions with original/translated transcript · key-moment detection · automatic conversation summary · transcript / subtitle (SRT, VTT) / translated-audio export · network-aware adaptive streaming · real-time latency HUD · multimodal (voice + text) emotion detection · context-aware sarcasm detection · explainable tone/sarcasm ("Why this tone?") · conversation memory. How each maps onto the pipeline, and what is and isn't validated, is in [ARCHITECTURE.md §7](./ARCHITECTURE.md).
+
 ---
 
 ## Tech stack
