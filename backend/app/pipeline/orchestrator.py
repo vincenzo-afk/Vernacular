@@ -240,6 +240,17 @@ class SessionOrchestrator:
         self._target_language = target_language
         self._voice_id = voice_id
         self._fallback_tts = fallback_tts
+        # Rolling conversation memory: earlier turns feed context-aware
+        # sarcasm detection and consistent translation, and the
+        # summarizer reads it. Owned here so every stage sees the same one.
+        self._memory = memory if memory is not None else ConversationMemory()
+        self._prosody = prosody if prosody is not None else ProsodyAnalyzer()
+        # Off by default so the event stream stays exactly
+        # SegmentStart/AudioChunk*/SegmentEnd for callers that do not
+        # render captions; the WebSocket session turns it on.
+        self._emit_captions = emit_captions
+        self._use_context = use_context
+        self._prosody_error_logged = False
         # Sticky: once the primary TTS provider fails, every remaining
         # segment in this session uses the fallback. Flapping between
         # providers mid-session produces jarring voice changes (see
