@@ -177,7 +177,45 @@ class SegmentEnd:
     pass
 
 
-SegmentEvent = SegmentStart | AudioChunk | SegmentEnd
+@dataclass
+class CaptionEvent:
+    """
+    A live caption: the source-language transcript as STT hears it.
+    Partial captions (`is_final=False`) are superseded by the next
+    partial; the final caption (`is_final=True`, carrying the
+    `segment_id` the eventual SegmentStart will use) arrives BEFORE
+    translation completes, so the original text is on screen while the
+    translation is still being produced. Only emitted when the
+    orchestrator is built with `emit_captions=True`.
+    """
+
+    text: str
+    is_final: bool
+    segment_id: int | None = None
+
+
+SegmentEvent = CaptionEvent | SegmentStart | AudioChunk | SegmentEnd
+
+
+@dataclass
+class _FinalJob:
+    """A finalized utterance waiting for (or in) the worker."""
+
+    segment_id: int
+    event: TranscriptEvent
+    speculative_task: asyncio.Task | None
+    speculative_text: str
+    detect_sink: dict
+    audio: UtteranceAudio
+    final_at_ms: float
+
+
+@dataclass
+class _Failure:
+    exc: BaseException
+
+
+_DONE = object()
 
 
 class SessionOrchestrator:
