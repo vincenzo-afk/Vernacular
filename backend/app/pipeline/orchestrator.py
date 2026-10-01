@@ -302,59 +302,229 @@ class SessionOrchestrator:
         self, audio_chunks: AsyncIterator[bytes]
     ) -> AsyncIterator[SegmentEvent]:
         """
-        Consumes source audio and yields a stream of events per
-        completed utterance: SegmentStart, then AudioChunk* as the TTS
-        provider emits bytes (NOT after the clip is finished), then
-        SegmentEnd. See module docstring for the concurrency model.
+        Consumes source audio and yields a stream of events: optional
+        CaptionEvents as the transcript evolves, and per completed
+        utterance a SegmentStart, then AudioChunk* as the TTS provider
+        emits bytes (NOT after the clip is finished), then SegmentEnd.
+        See the module docstring for the pump/worker concurrency model.
 
         Design: each STT partial launches a speculative register-
         detection task running concurrently with STT's own work of
         reaching a final transcript. When a final transcript arrives,
-        we reuse that speculative result if it's still valid (see
-        _resolve_style_for_final) rather than blocking on a cold
+        the worker reuses that speculative result if it's still valid
+        (see _resolve_style_for_final) rather than blocking on a cold
         register-detection call.
+
+        Failure isolation: a failure inside one segment is caught in
+        the worker and never kills the session; a failure of the STT
+        stream itself is re-raised here, AFTER the segments queued
+        before it have been delivered (as it was when segments were
+        processed inline).
         """
-        # Tracks the in-flight speculative register-detection task
-        # together with the exact partial-transcript text it was
-        # launched against, so _resolve_style_for_final can actually
-        # verify the "is this still valid" heuristic described below
-        # instead of blindly trusting whatever finished first.
+        work: asyncio.Queue = asyncio.Queue()
+        out: asyncio.Queue = asyncio.Queue()
+        pump = asyncio.create_task(
+            self._pump_stt(self._tap_audio(audio_chunks), work, out)
+        )
+        worker = asyncio.create_task(self._worker(work, out))
+        try:
+            while True:
+                item = await out.get()
+                if item is _DONE:
+                    return
+                if isinstance(item, _Failure):
+                    raise item.exc
+                yield item
+        finally:
+            # Cancel rather than abandon: an unreferenced background
+            # task is a resource leak and hides its failures.
+            for task in (pump, worker):
+                task.cancel()
+            await asyncio.gather(pump, worker, return_exceptions=True)
+
+    # ------------------------------------------------------------ audio tap
+
+    async def _tap_audio(
+        self, audio_chunks: AsyncIterator[bytes]
+    ) -> AsyncIterator[bytes]:
+        """
+        Passes every mic chunk through to STT unchanged while feeding
+        the voice analyzer. Analysis is best-effort: it must never
+        interrupt the audio path, so any error is logged once and the
+        chunk still goes on to STT.
+        """
+        async for chunk in audio_chunks:
+            try:
+                self._prosody.feed(chunk)
+            except Exception:
+                if not self._prosody_error_logged:
+                    self._prosody_error_logged = True
+                    logger.exception(
+                        "orchestrator: prosody analysis failed; continuing "
+                        "without acoustic features for this chunk"
+                    )
+            yield chunk
+
+    def _snapshot_acoustic(self) -> AcousticFeatures | None:
+        try:
+            return self._prosody.snapshot()
+        except Exception:
+            logger.exception("orchestrator: acoustic snapshot failed")
+            return None
+
+    def _finish_utterance(self) -> UtteranceAudio:
+        try:
+            return self._prosody.finish_utterance()
+        except Exception:
+            logger.exception("orchestrator: finishing utterance audio failed")
+            return UtteranceAudio(None, None, None)
+
+    # --------------------------------------------------------- pump / worker
+
+    async def _pump_stt(
+        self,
+        audio: AsyncIterator[bytes],
+        work: asyncio.Queue,
+        out: asyncio.Queue,
+    ) -> None:
+        """
+        Reads STT events as fast as they arrive and never waits on a
+        segment: partials become captions plus a speculative detection
+        task; finals become a job for the worker.
+        """
         speculative_task: asyncio.Task | None = None
-        speculative_source_text: str = ""
+        speculative_text = ""
+        detect_sink: dict = {}
+        try:
+            async for event in self._stt.stream(audio):
+                if not event.is_final:
+                    if self._emit_captions:
+                        out.put_nowait(CaptionEvent(text=event.text, is_final=False))
+                    # Kick off (or replace) a speculative register-
+                    # detection pass on this partial. We deliberately
+                    # don't await it -- it runs concurrently while STT
+                    # keeps streaming.
+                    if speculative_task is not None and not speculative_task.done():
+                        speculative_task.cancel()
+                    detect_sink = {}
+                    context, _ = self._detection_context(before=None)
+                    speculative_task = asyncio.create_task(
+                        self._run_register_detection(
+                            event,
+                            context=context or None,
+                            acoustic=self._snapshot_acoustic(),
+                            sink=detect_sink,
+                        )
+                    )
+                    speculative_text = event.text
+                    continue
 
-        async for event in self._stt.stream(audio_chunks):
-            if not event.is_final:
-                # Kick off (or replace) a speculative register-detection
-                # pass on this partial. We deliberately don't await it
-                # here — it runs concurrently while STT keeps streaming.
-                if speculative_task is not None and not speculative_task.done():
-                    speculative_task.cancel()
-                speculative_task = asyncio.create_task(
-                    self._run_register_detection(event)
+                # Final transcript for this segment has arrived.
+                final_at = time.monotonic() * 1000
+                segment_id = self._next_segment_id()
+                self._memory.begin_turn(segment_id, event.text)
+                audio_info = self._finish_utterance()
+                if self._emit_captions:
+                    out.put_nowait(
+                        CaptionEvent(
+                            text=event.text, is_final=True, segment_id=segment_id
+                        )
+                    )
+                work.put_nowait(
+                    _FinalJob(
+                        segment_id=segment_id,
+                        event=event,
+                        speculative_task=speculative_task,
+                        speculative_text=speculative_text,
+                        detect_sink=detect_sink,
+                        audio=audio_info,
+                        final_at_ms=final_at,
+                    )
                 )
-                speculative_source_text = event.text
-                continue
+                speculative_task = None
+                speculative_text = ""
+                detect_sink = {}
+        except asyncio.CancelledError:
+            if speculative_task is not None and not speculative_task.done():
+                speculative_task.cancel()
+            raise
+        except Exception as exc:
+            logger.exception("orchestrator: STT stream failed")
+            if speculative_task is not None and not speculative_task.done():
+                speculative_task.cancel()
+            work.put_nowait(_Failure(exc))
+            return
+        if speculative_task is not None and not speculative_task.done():
+            speculative_task.cancel()
+        work.put_nowait(None)  # clean end of the audio stream
 
-            # Final transcript for this segment has arrived.
-            segment_id = self._next_segment_id()
-            style = await self._resolve_style_for_final(
-                event, speculative_task, speculative_source_text
-            )
-            speculative_task = None
-            speculative_source_text = ""
-
+    async def _worker(self, work: asyncio.Queue, out: asyncio.Queue) -> None:
+        """Processes finalized utterances strictly in order."""
+        while True:
+            job = await work.get()
+            if job is None:
+                out.put_nowait(_DONE)
+                return
+            if isinstance(job, _Failure):
+                out.put_nowait(job)
+                return
             # Isolation contract: a failure inside one segment must
-            # never kill the session. We can't wrap a `yield` in
-            # try/except and keep streaming, so the segment generator
-            # handles its own errors and always terminates cleanly.
-            async for segment_event in self._process_segment(segment_id, event, style):
-                yield segment_event
+            # never kill the session.
+            try:
+                async for segment_event in self._handle_job(job):
+                    out.put_nowait(segment_event)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "orchestrator: segment %s failed unexpectedly, skipping "
+                    "it rather than killing the session",
+                    job.segment_id,
+                )
+
+    async def _handle_job(self, job: _FinalJob) -> AsyncIterator[SegmentEvent]:
+        picked_up = time.monotonic() * 1000
+        context, _ = self._detection_context(before=job.segment_id)
+        style = await self._resolve_style_for_final(
+            job.event,
+            job.speculative_task,
+            job.speculative_text,
+            context=context or None,
+            acoustic=job.audio.features,
+            sink=job.detect_sink,
+        )
+        style_wait_ms = time.monotonic() * 1000 - picked_up
+        # Re-fuse with the FINAL utterance's audio: a speculative
+        # reading was made on the partial's audio so far. Idempotent.
+        style = fuse_modalities(style, job.audio.features, job.event.words)
+        async for segment_event in self._process_segment(
+            job.segment_id,
+            job.event,
+            style,
+            job=job,
+            queue_wait_ms=picked_up - job.final_at_ms,
+            style_wait_ms=style_wait_ms,
+        ):
+            yield segment_event
+
+    def _detection_context(self, before: int | None) -> tuple[str, int]:
+        if not self._use_context:
+            return "", 0
+        return self._memory.detection_context(before=before)
+
+    def _translation_context(self, before: int | None) -> tuple[str, int]:
+        if not self._use_context:
+            return "", 0
+        return self._memory.translation_context(before=before)
 
     async def _resolve_style_for_final(
         self,
         event: TranscriptEvent,
         speculative_task: asyncio.Task | None,
         speculative_source_text: str,
+        context: str | None = None,
+        acoustic: AcousticFeatures | None = None,
+        sink: dict | None = None,
     ) -> StyleMetadata:
         """
         Prefers the speculative reading from the partial-transcript
