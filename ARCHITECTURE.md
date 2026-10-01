@@ -182,8 +182,52 @@ This is a living section — update it as the implementation progresses. Track a
 | Frontend: translated audio playback | Implemented, not yet heard on real hardware — `lib/player.ts` (`PcmPlayer`) decodes the server-declared PCM16 format, carries odd trailing bytes across frames (`lib/pcm.ts`, unit-tested), and schedules buffers gaplessly on the `AudioContext` clock, resyncing after underruns. Pure logic covered by `npm test` (6 tests); the `AudioContext` path itself is unverified in a browser (see `CONTRIBUTING.md` "Known gaps"). |
 | Frontend: waveform visualization | Stub — `Waveform.tsx` renders a static placeholder, not real amplitude data |
 | Frontend type-checking / linting | Done — `npm run typecheck` (`tsc --noEmit --strict`, clean) and `npm run lint` (ESLint flat config with `typescript-eslint` + `react-hooks` rules, clean) |
-| Test suite (backend, unit + integration, against fakes) | Done — 114 backend tests + 6 frontend tests passing, see `TESTING.md` for the full breakdown by file |
+| Live captions (`caption` messages, pump/worker orchestrator) | Done, tested against fakes — captions keep flowing while the previous segment is still being spoken (`test_live_captions_and_context.py`, verified to deadlock on the old inline design). Not run against live STT. |
+| Conversation memory + context-aware sarcasm detection | Done — `app/conversation.py`; earlier turns feed detection and translation; paired few-shots teach that identical words flip with context. Effect on a real LLM's accuracy is **not evaluated**. |
+| Explainable tone/sarcasm | Done — `explanation` on `StyleMetadata`; LLM cues marked unverified, measured cues marked measured. Honesty of the model's own explanations is not evaluated. |
+| Multimodal emotion detection | Done — `pipeline/prosody.py` measures loudness/pitch from the mic audio; `fuse_modalities` adds `arousal` and `modality_conflict`. Verified on synthetic signals only; the arousal heuristic has **never been checked against real emotional speech**. |
+| Key-moment detection | Done — `app/insights.py`, deterministic, no LLM. Thresholds are hand-set, not tuned on data. |
+| Conversation summary | Done — `pipeline/summarizer.py`, on request, off the hot path, extractive fallback. |
+| Export (transcript / subtitles / audio) | Done in the browser (`lib/export.ts`); pure functions unit-tested (SRT/VTT format, WAV header). Not opened in a real subtitle player/DAW. |
+| Network-aware adaptive streaming | Done — `app/adaptive.py` + `lib/network.ts`; tiered policy, hysteresis, server-side congestion detection from send times. Thresholds are reasoned, not tuned on real networks. |
+| Real-time latency HUD | Done — per-segment `timings` on the wire, `LatencyHud.tsx`. Shows server-side time only (excludes STT endpointing and playback) and says so. |
+| Test suite (backend, unit + integration, against fakes) | Done — see `TESTING.md` for the breakdown by file. Counts drift; run the suites rather than trusting a number in a doc. |
 | Live/integration tests against real provider APIs | Planned — `tests/live/` is currently an empty scaffold, see `TESTING.md` |
 | Latency benchmarking against live APIs | Tooling exists (`--live`); has never been run — see the "Latency measurement" row |
 
 **What an agent picking this up next should prioritize:** the whole path from microphone to speaker is now implemented and tested against fakes: mic capture, AssemblyAI streaming STT, register detection, register-aware translation, streaming TTS with sticky failover, and gapless PCM playback. What has **not** happened is any contact with reality. In order of value: (1) run it once against real AssemblyAI / LLM / ElevenLabs accounts and listen to it — every provider call shape here comes from documentation, not from a successful call; (2) run `python -m app.benchmark --live` to get the first real latency numbers against the ~2s budget; (3) hear `PcmPlayer` on real hardware, with headphones (echo handling is not implemented, see `CONTRIBUTING.md` "Known gaps"); (4) the voice-cloning consent flow, which must exist before cloning is enabled. `tests/live/` remains an empty scaffold and is the natural home for (1) and (2).
+
+---
+
+## 7. Feature layer
+
+How the ten user-facing features map onto the pipeline. Everything here respects the constraints above: style information is typed fields on `StyleMetadata`, provider calls stay inside `pipeline/`, and every new failure mode has a fallback (§5).
+
+```
+mic ──tap──▶ ProsodyAnalyzer ─────────────┐ (acoustic features, per utterance)
+ │                                        ▼
+ ▼                                  RegisterDetector ◀── ConversationMemory (earlier turns)
+STT ──partial──▶ CaptionEvent              │  StyleMetadata (+ explanation, arousal, conflict)
+ │  └─final───▶ CaptionEvent(id) ──▶ worker: translate ◀── ConversationMemory
+ │                                          │  detect_key_moment(style, previous)
+ │                                          ▼
+ │                                     TTS stream ──▶ SegmentStart{style, key_moment, timings} + audio
+ └──────────────────────────────────────────────────▶ ws/session.py ──▶ AdaptiveController
+                                                       (throttle captions, coalesce audio)
+on request:  ConversationMemory ──▶ ConversationSummarizer ──▶ summary message
+```
+
+| Feature | Where | Notes |
+|---|---|---|
+| Live captions + original/translated transcript | `orchestrator.py` (`CaptionEvent`, pump/worker), `LiveTranscript.tsx` | The pump reads STT independently of the worker, so partial captions stay live during playback. Finals carry the `segment_id` of the segment that follows. |
+| Key-moment detection | `app/insights.py` | Scores sarcasm, urgency, strong emotion, emotion shift, voice/word conflict, high arousal; discounted by detector confidence. |
+| Automatic summary | `pipeline/summarizer.py` | `{"type":"summarize"}` → one LLM call over the memory, extractive fallback. |
+| Transcript / audio / subtitle export | `lib/export.ts`, `ExportMenu.tsx` | Client-side. SRT/VTT timing comes from the server's voice-activity gate (`speech_start_ms`/`speech_end_ms`, mic clock); estimated from text length when absent. Audio is the translated speech only, capped at 64 MB. |
+| Network-aware adaptive streaming | `app/adaptive.py`, `lib/network.ts` | Client reports RTT/connection/backlog tier; server also infers congestion from its own send times; the worse signal wins. |
+| Latency HUD | `SegmentTimings`, `LatencyHud.tsx`, `lib/latency.ts` | Per-segment queue / tone-wait / translate / TTFB, p50/p90 over the session, RTT from ping/pong. |
+| Multimodal emotion | `pipeline/prosody.py` | Voice measured from audio, relative to the speaker's baseline; fused with the text reading. |
+| Context-aware sarcasm | `conversation.py`, detector prompt | Only turns *before* the current one are supplied (a regression test pins this — the STT pump can run ahead of the worker). |
+| Explainable tone/sarcasm | `StyleExplanation`, `ExplainPanel.tsx` | Measured vs model-stated evidence shown differently. |
+| Conversation memory | `conversation.py` | Bounded (500 turns; 600 chars per prompt), two-phase turns, exposed as `orchestrator.memory`. Memory is per session and in-process; it is not persisted. |
+
+**Explicit non-claims.** Nothing in this layer has been validated with live providers or on real hardware. The arousal heuristic, key-moment thresholds and network thresholds are reasoned defaults, not tuned or evaluated on data. Sarcasm detection quality with a real LLM is unknown — the paired few-shots make the intended behaviour explicit, they do not prove it. Sarcasm is a hard, ambiguous task; treat `sarcasm_score` as a graded hint.
