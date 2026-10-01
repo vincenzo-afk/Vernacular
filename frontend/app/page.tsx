@@ -92,23 +92,57 @@ registerProcessor("pcm-downsampler", PcmDownsampler);
 
 export default function Home() {
   const [targetLanguage, setTargetLanguage] = useState("es");
+  const [sessionLanguage, setSessionLanguage] = useState("es");
   const [connectionState, setConnectionState] =
     useState<ConnectionState>("idle");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [sourceText, setSourceText] = useState("");
-  const [translatedText, setTranslatedText] = useState("");
-  const [styleTag, setStyleTag] = useState<StyleTag | null>(null);
   const [degraded, setDegraded] = useState(false);
+
+  // Captions + transcript
+  const [live, setLive] = useState<LiveCaption | null>(null);
+  const [segments, setSegments] = useState<SegmentMessage[]>([]);
+  const [view, setView] = useState<TranscriptView>("both");
+  const [keyOnly, setKeyOnly] = useState(false);
+
+  // Latency HUD / adaptive streaming
+  const [rttMs, setRttMs] = useState<number | null>(null);
+  const [tier, setTier] = useState<NetworkTier>("good");
+  const [serverSendMs, setServerSendMs] = useState<number | null>(null);
+
+  // Summary
+  const [summary, setSummary] = useState<SummaryMessage | null>(null);
+  const [summaryPending, setSummaryPending] = useState(false);
+
+  // Export
+  const [audioFormat, setAudioFormat] = useState<AudioFormat | null>(null);
+  const [audioTruncated, setAudioTruncated] = useState(false);
 
   const sessionRef = useRef<VernacularSession | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const playerRef = useRef<PcmPlayer | null>(null);
+  const probeRef = useRef(new RttProbe());
+  const trackerRef = useRef(new TierTracker());
+  const probeTimerRef = useRef<number | null>(null);
+  const summaryTimerRef = useRef<number | null>(null);
+  // Translated audio kept for export, capped (see MAX_AUDIO_BYTES).
+  const audioChunksRef = useRef<ArrayBuffer[]>([]);
+  const audioBytesRef = useRef(0);
 
   const stop = useCallback(() => {
     sessionRef.current?.close();
     sessionRef.current = null;
+
+    if (probeTimerRef.current !== null) {
+      window.clearInterval(probeTimerRef.current);
+      probeTimerRef.current = null;
+    }
+    if (summaryTimerRef.current !== null) {
+      window.clearTimeout(summaryTimerRef.current);
+      summaryTimerRef.current = null;
+    }
+    setSummaryPending(false);
 
     workletNodeRef.current?.disconnect();
     workletNodeRef.current = null;
@@ -125,10 +159,29 @@ export default function Home() {
     setConnectionState("idle");
   }, []);
 
+  // Release the mic, sockets and timers if the page is left mid-session.
+  useEffect(() => stop, [stop]);
+
   const start = useCallback(async () => {
     setErrorMessage(null);
     setDegraded(false);
     setConnectionState("connecting");
+
+    // A new session starts a new transcript (the previous one stays
+    // exportable until now).
+    setSegments([]);
+    setLive(null);
+    setSummary(null);
+    setRttMs(null);
+    setServerSendMs(null);
+    setTier("good");
+    setAudioTruncated(false);
+    setAudioFormat(null);
+    setSessionLanguage(targetLanguage);
+    audioChunksRef.current = [];
+    audioBytesRef.current = 0;
+    probeRef.current = new RttProbe();
+    trackerRef.current = new TierTracker();
 
     let stream: MediaStream;
     try {
