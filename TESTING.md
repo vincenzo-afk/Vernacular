@@ -38,12 +38,20 @@ backend/tests/
 │   ├── test_wire_contract.py             # backend wire JSON == frontend ws-client.ts types
 │   ├── test_docs_examples.py             # every StyleMetadata example in the docs validates
 │   ├── test_latency.py                   # percentile/budget math + real-orchestrator timing
-│   └── test_benchmark.py                 # benchmark CLI: dry-run correctness, live guard rails
+│   ├── test_benchmark.py                 # benchmark CLI: dry-run correctness, live guard rails
+│   ├── test_prosody.py                   # voice analysis + fusion, on synthetic signals
+│   ├── test_conversation_and_insights.py # memory (bounded, no future context) + key moments
+│   ├── test_adaptive.py                  # network tiers, hysteresis, throttle, coalescer
+│   ├── test_summarizer.py                # LLM summary, sanitising, extractive fallback
+│   ├── test_detector_context_explain.py  # context/acoustic in prompt; explanation trust rules
+│   └── test_translator_context.py        # context in, measured fields carried through
 ├── integration/
 │   ├── test_orchestrator_flow.py         # full pipeline, all fakes wired together
 │   ├── test_tts_failover.py              # sticky primary -> fallback TTS failover
 │   ├── test_streaming_latency.py         # audio streams; it is NOT buffered per clip
-│   └── test_ws_roundtrip.py              # real WebSocket: ready -> segment -> audio frames
+│   ├── test_ws_roundtrip.py              # real WebSocket: ready -> segment -> audio frames
+│   ├── test_live_captions_and_context.py # captions live during playback; context; timings; failures
+│   └── test_session_controls.py          # captions/throttle/coalesce/ping/summary over a fake socket
 └── live/                            # opt-in, requires real API keys, skipped by default
     └── (empty scaffold — see "Live tests" below; nothing implemented yet)
 ```
@@ -160,3 +168,14 @@ Both are checked into CI expectations the same way the backend's offline pytest 
 If a future change adds real interactivity tests (e.g. Playwright driving the mic-permission flow), they belong in a new `frontend/tests/` directory, offline-by-default per the same philosophy as the backend: fake the WebSocket server (there's already a real-local-server pattern to follow — see `backend/tests/unit/test_stt.py`'s `FakeAssemblyAIServer` for the equivalent idea applied to a different protocol) rather than requiring a live backend and live provider APIs to run the frontend's own test suite.
 
 **What `npm run typecheck` would have caught, historically:** the wire format documented in `backend/app/ws/session.py`'s module docstring and the shape `frontend/lib/ws-client.ts` actually parses have to match exactly (segment/error message shapes, field names). There's no shared schema codegen between them (see `CONTRIBUTING.md` "Known gaps") — `tsc --noEmit` won't catch a backend field rename by itself, but it *will* catch a frontend consumer (e.g. a component) using a field that no longer exists on `StyleTag`/`SegmentMessage` if `ws-client.ts` is updated correctly and a consumer isn't. Keep that manual-sync discipline in mind: updating one side without checking the other is exactly the kind of change `npm run typecheck` is meant to catch, but only if you actually run it.
+
+### Feature-layer tests (captions, multimodal, explainability, adaptive streaming, summary)
+
+- **`test_prosody.py`**: pitch recovered within 2% on synthetic voices; louder/higher-than-baseline raises arousal by a real margin; chunk boundaries don't change results; bounded memory; a real-time-factor ceiling (the hot-path guard). Three mutations of the analyzer were each verified to fail a test. **Synthetic signals only** — this proves the maths, not that arousal tracks real emotion.
+- **`test_conversation_and_insights.py`**: includes the regression for a real bug found while writing the orchestrator tests: the STT pump can run ahead of the worker, so utterance 1 was being given utterance 2 as "earlier" context. Context is now strictly `segment_id < current`.
+- **`test_live_captions_and_context.py`**: the headline test blocks the TTS and requires a partial caption for the *next* utterance to still arrive (deadlocks on the old inline design). Also: final caption precedes its segment and shares its id; captions off by default keeps the old event stream; context reaches both LLM prompts; a backed-up pipeline shows as `queue_wait_ms`; a crashing voice analyzer never interrupts audio.
+- **`test_session_controls.py`**: uses a hand-rolled fake WebSocket so send timing is controllable — including proving the *server* detects congestion from slow sends without any client report, and that coalescing never changes a byte of audio.
+- **`test_wire_contract.py`** now also covers `CaptionMessage`, `NetworkMessage`, `SummaryMessage`, `PongMessage`, `AcousticTag`, `ExplanationTag`, `CueTag`, `KeyMomentTag`, `TimingsTag` and the `CueKind` union.
+- **Frontend (`npm test`)**: `export.test.ts` (SRT/VTT format, cue overlap rules, WAV header, transcript formats) and `network-latency.test.ts` (tier classification/hysteresis, latency percentiles, RTT probe).
+
+None of these touch a live provider. What is **not** tested: real STT/LLM/TTS behaviour, real microphones, real networks, the React UI in a browser, and playback of exported files in external players.
