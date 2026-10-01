@@ -426,3 +426,7 @@ async def run_session(
                 "socket likely already closed",
                 exc_info=True,
             )
+    finally:
+        for task in background:
+            task.cancel()
+        await asyncio.gather(*background, return_exceptions=True)
