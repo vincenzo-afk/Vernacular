@@ -89,13 +89,43 @@ should carry stress (translate the concept, not necessarily the source word),
 
 
 def _build_user_prompt(
-    source_text: str, source_style: StyleMetadata, target_language: str
+    source_text: str,
+    source_style: StyleMetadata,
+    target_language: str,
+    context: str | None = None,
 ) -> str:
-    return (
-        f"Target language: {target_language}\n\n"
-        f"Source text: {source_text}\n\n"
-        f"Source register: {source_style.model_dump_json()}\n\n"
-        f"Output:"
+    # Only the eight register fields go to the LLM: the measured
+    # acoustic block and the explanation are not the translator's
+    # business (extra input tokens on the latency path, and the model
+    # has no business rewriting measurements).
+    parts = [f"Target language: {target_language}"]
+    if context and context.strip():
+        parts.append(
+            "Earlier turns (original -> translation; context only, "
+            f"oldest first):\n{context.strip()}"
+        )
+    parts.append(f"Source text: {source_text}")
+    parts.append(f"Source register: {json.dumps(source_style.register_dict())}")
+    parts.append("Output:")
+    return "\n\n".join(parts)
+
+
+def _carry_measured(result_style: StyleMetadata, source: StyleMetadata) -> StyleMetadata:
+    """
+    Copies the fields that describe the SPEAKER'S DELIVERY rather than
+    the target-language text (measured acoustics, fused arousal, the
+    modality-conflict flag, the explanation of the source reading) from
+    the source style onto the translator's output style. The LLM only
+    sees and returns the eight register fields, so without this the
+    measurements would be silently dropped at the translation stage.
+    """
+    return result_style.model_copy(
+        update={
+            "acoustic": source.acoustic,
+            "arousal": source.arousal,
+            "modality_conflict": source.modality_conflict,
+            "explanation": source.explanation,
+        }
     )
 
 
@@ -108,8 +138,12 @@ class Translator:
         source_text: str,
         source_style: StyleMetadata,
         target_language: str,
+        context: str | None = None,
     ) -> TranslationResult:
         """
+        `context` is the rendered earlier-turns block from
+        ConversationMemory.translation_context() (optional).
+
         On failure: retry once with a shorter timeout. If that also
         fails, fall back to a literal (register-naive) translation
         rather than dropping the utterance — see ARCHITECTURE.md §5
