@@ -276,6 +276,8 @@ class SessionOrchestrator:
         current: SegmentStart | None = None
         chunks: list[bytes] = []
         async for event in self.run_stream(audio_chunks):
+            if isinstance(event, CaptionEvent):
+                continue
             if isinstance(event, SegmentStart):
                 current, chunks = event, []
             elif isinstance(event, AudioChunk):
