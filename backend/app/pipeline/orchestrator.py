@@ -70,6 +70,53 @@ class StageTiming:
 
 
 @dataclass
+class SegmentTimings:
+    """
+    Per-segment latency breakdown, in ms, for the latency HUD. Unlike
+    `StageTiming` (aggregate, for percentiles) this is one segment's
+    own numbers, sent to the client with the segment.
+
+    Critical path for this segment, from the moment its FINAL transcript
+    reached the orchestrator to its first audio byte:
+        queue_wait + style_wait + translation + tts_first_byte
+    == server_total_ms (up to scheduling noise). STT endpointing, the
+    network, and browser playback are NOT in here -- the client adds
+    what it can see (lib/latency.ts).
+    """
+
+    # Time the finished transcript waited behind the previous segment
+    # still being translated/spoken. Nonzero = the pipeline is backed up.
+    queue_wait_ms: float = 0.0
+    # Time blocked waiting for the register reading after the final
+    # arrived. ~0 when the speculative pass on partials had finished.
+    style_wait_ms: float = 0.0
+    # How long the detection LLM call itself took (mostly hidden behind
+    # STT finalization when speculative). None if unknown.
+    register_detection_ms: float | None = None
+    translation_ms: float = 0.0
+    tts_first_byte_ms: float | None = None
+    server_total_ms: float = 0.0
+
+    def to_wire(self) -> dict:
+        return {
+            "queue_wait_ms": round(self.queue_wait_ms, 1),
+            "style_wait_ms": round(self.style_wait_ms, 1),
+            "register_detection_ms": (
+                None
+                if self.register_detection_ms is None
+                else round(self.register_detection_ms, 1)
+            ),
+            "translation_ms": round(self.translation_ms, 1),
+            "tts_first_byte_ms": (
+                None
+                if self.tts_first_byte_ms is None
+                else round(self.tts_first_byte_ms, 1)
+            ),
+            "server_total_ms": round(self.server_total_ms, 1),
+        }
+
+
+@dataclass
 class SegmentOutput:
     """
     One translated-and-synthesized segment's worth of output, paired
