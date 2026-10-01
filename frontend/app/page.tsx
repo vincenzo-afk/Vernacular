@@ -296,6 +296,29 @@ export default function Home() {
     sessionRef.current = session;
     session.connect();
 
+    // Network monitor: measure RTT with ping/pong, classify the link
+    // (RTT, connection type, our own send backlog) and tell the server,
+    // which adapts caption rate and audio framing (see lib/network.ts
+    // and backend/app/adaptive.py).
+    probeTimerRef.current = window.setInterval(() => {
+      const active = sessionRef.current;
+      if (!active) return;
+      const now = performance.now();
+      const stalled = probeRef.current.oldestPendingMs(now);
+      const rtt =
+        stalled !== null && stalled > LOST_PONG_MS
+          ? stalled
+          : probeRef.current.last;
+      const observed = classifyNetwork({
+        rttMs: rtt,
+        ...readConnectionInfo(),
+        bufferedBytes: active.bufferedAmount,
+      });
+      const changed = trackerRef.current.update(observed);
+      if (changed) active.sendNetworkReport(changed, rtt);
+      active.sendPing(probeRef.current.start(now));
+    }, PROBE_INTERVAL_MS);
+
     const source = audioContext.createMediaStreamSource(stream);
     const workletNode = new AudioWorkletNode(audioContext, "pcm-downsampler", {
       processorOptions: { targetSampleRate: TARGET_SAMPLE_RATE },
@@ -308,12 +331,40 @@ export default function Home() {
 
     source.connect(workletNode);
     setConnectionState("live");
-  }, [targetLanguage]);
+  }, [targetLanguage, stop]);
+
+  const requestSummary = useCallback(() => {
+    if (!sessionRef.current) return;
+    setSummaryPending(true);
+    sessionRef.current.requestSummary("target");
+    if (summaryTimerRef.current !== null) {
+      window.clearTimeout(summaryTimerRef.current);
+    }
+    // Don't leave the button stuck if the reply never comes.
+    summaryTimerRef.current = window.setTimeout(() => {
+      setSummaryPending(false);
+      summaryTimerRef.current = null;
+    }, SUMMARY_TIMEOUT_MS);
+  }, []);
+
+  const getAudio = useCallback(
+    () =>
+      audioChunksRef.current.length > 0
+        ? concatChunks(audioChunksRef.current)
+        : null,
+    []
+  );
+
+  const exportSegments = useMemo(() => segments.map(toExportSegment), [segments]);
+  const latency = useMemo(
+    () => summarizeLatency(segments.map((s) => s.timings)),
+    [segments]
+  );
 
   const isLive = connectionState === "live";
 
   return (
-    <main className="min-h-screen bg-neutral-950 text-neutral-50 flex flex-col items-center justify-center gap-6 p-8">
+    <main className="min-h-screen bg-neutral-950 text-neutral-50 flex flex-col items-center gap-6 p-8">
       <h1 className="text-3xl font-semibold">Vernacular</h1>
       <p className="text-neutral-400 max-w-md text-center">
         Real-time voice translation that preserves how you speak, not
