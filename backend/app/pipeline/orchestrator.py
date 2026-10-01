@@ -668,11 +668,34 @@ class SessionOrchestrator:
                     # the now-final `degraded` flag) and record TTFB --
                     # the metric the ~2s budget in ARCHITECTURE.md §3
                     # actually cares about, not total synthesis time.
+                    ttfb_ms = time.monotonic() * 1000 - tts_start
                     yield SegmentStart(
                         source_text=event.text,
                         translated_text=translation.translated_text,
                         style=translation.style,
                         degraded=degraded,
+                        segment_id=segment_id,
+                        key_moment=key_moment,
+                        timings=SegmentTimings(
+                            queue_wait_ms=queue_wait_ms,
+                            style_wait_ms=style_wait_ms,
+                            register_detection_ms=(
+                                job.detect_sink.get("ms") if job else None
+                            ),
+                            translation_ms=translation_ms,
+                            tts_first_byte_ms=ttfb_ms,
+                            server_total_ms=(
+                                time.monotonic() * 1000 - job.final_at_ms
+                                if job
+                                else queue_wait_ms
+                                + style_wait_ms
+                                + translation_ms
+                                + ttfb_ms
+                            ),
+                        ),
+                        speech_start_ms=job.audio.speech_start_ms if job else None,
+                        speech_end_ms=job.audio.speech_end_ms if job else None,
+                        context_turns=context_turns,
                     )
                     started = True
                 if not first_byte_recorded:
@@ -745,10 +768,11 @@ class SessionOrchestrator:
         self._segment_counter += 1
         return self._segment_counter
 
-    def _record(self, stage: str, start_ms: float) -> None:
+    def _record(self, stage: str, start_ms: float) -> float:
         self.timings.append(
             StageTiming(stage=stage, start_ms=start_ms, end_ms=time.monotonic() * 1000)
         )
         logger.debug(
             "stage=%s duration_ms=%.1f", stage, self.timings[-1].duration_ms
         )
+        return self.timings[-1].duration_ms
