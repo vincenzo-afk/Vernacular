@@ -328,23 +328,45 @@ class RegisterDetector:
     # is. Tune against real latency numbers (tests/live/).
     TIMEOUT_S = 1.5
 
-    def __init__(self, llm_client: LLMClient) -> None:
-        self._llm_client = llm_client
+    # Output-token ceilings. The explanation adds roughly 60-100 output
+    # tokens per call, which is real generation time on the hot path
+    # (register detection is speculative, so it is usually hidden behind
+    # STT finalization -- but it is NOT free). If a live benchmark shows
+    # this stage blowing its budget, construct with explain=False.
+    MAX_TOKENS = 300
+    MAX_TOKENS_EXPLAIN = 480
 
-    async def detect(self, transcript: TranscriptEvent) -> StyleMetadata:
+    def __init__(self, llm_client: LLMClient, explain: bool = True) -> None:
+        self._llm_client = llm_client
+        self._explain = explain
+        self._system_prompt = _build_system_prompt(explain)
+
+    async def detect(
+        self,
+        transcript: TranscriptEvent,
+        context: str | None = None,
+        acoustic: AcousticFeatures | None = None,
+    ) -> StyleMetadata:
         """
         Returns StyleMetadata for the given transcript event. Falls
         back to StyleMetadata.neutral_fallback() on any failure or
         low-confidence result — never raises to the orchestrator for
         a detection failure, since losing register fidelity gracefully
         is far better than blocking translation (ARCHITECTURE.md §5).
+
+        `context` (earlier turns) and `acoustic` (measured voice
+        features) are optional extra evidence. The measured acoustic
+        features are attached to the result EVEN ON FALLBACK: they were
+        measured, not guessed, so a failed LLM call does not make them
+        untrue.
         """
         if not transcript.text.strip():
             return StyleMetadata.neutral_fallback()
 
         try:
             result = await asyncio.wait_for(
-                self._call_llm(transcript), timeout=self.TIMEOUT_S
+                self._call_llm(transcript, context, acoustic),
+                timeout=self.TIMEOUT_S,
             )
         except asyncio.TimeoutError:
             logger.warning(
@@ -352,13 +374,17 @@ class RegisterDetector:
                 "to neutral rather than stalling the segment",
                 self.TIMEOUT_S,
             )
-            return StyleMetadata.neutral_fallback()
+            return fuse_modalities(
+                StyleMetadata.neutral_fallback(), acoustic, transcript.words
+            )
         except Exception:
             logger.warning(
                 "register_detector: LLM call failed, falling back to neutral",
                 exc_info=True,
             )
-            return StyleMetadata.neutral_fallback()
+            return fuse_modalities(
+                StyleMetadata.neutral_fallback(), acoustic, transcript.words
+            )
 
         if result.confidence < self.CONFIDENCE_THRESHOLD:
             logger.info(
