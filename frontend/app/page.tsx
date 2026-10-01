@@ -218,12 +218,34 @@ export default function Home() {
     const session = new VernacularSession({
       wsUrl: WS_URL,
       targetLanguage,
-      onReady: (audio) => player.setFormat(audio),
-      onAudioChunk: (chunk) => player.push(chunk),
+      onReady: (audio) => {
+        player.setFormat(audio);
+        setAudioFormat(audio);
+      },
+      onAudioChunk: (chunk) => {
+        player.push(chunk);
+        // Keep a copy for export, up to the cap.
+        if (audioBytesRef.current + chunk.byteLength <= MAX_AUDIO_BYTES) {
+          audioChunksRef.current.push(chunk.slice(0));
+          audioBytesRef.current += chunk.byteLength;
+        } else {
+          setAudioTruncated(true);
+        }
+      },
+      onCaption: (caption) => {
+        setLive({
+          text: caption.text,
+          isFinal: caption.is_final,
+          segmentId: caption.segment_id,
+        });
+      },
       onSegment: (segment) => {
-        setSourceText(segment.source_text);
-        setTranslatedText(segment.translated_text);
-        setStyleTag(segment.style);
+        setSegments((prev) => [...prev, segment]);
+        // The final caption stays up until ITS translation lands; a
+        // newer partial (segmentId null) is a different utterance.
+        setLive((prev) =>
+          prev && prev.segmentId === segment.segment_id ? null : prev
+        );
         // Sticky on the backend (it never flaps back to the primary
         // voice mid-session), so mirror that: once degraded, stay
         // flagged until the session is restarted.
@@ -233,9 +255,35 @@ export default function Home() {
         // shift this one's first sample.
         player.endSegment();
       },
+      onNetwork: (network) => {
+        setServerSendMs(network.send_latency_ms);
+        setTier(network.tier);
+      },
+      onPong: (pong) => {
+        const rtt = probeRef.current.finish(pong.id, performance.now());
+        if (rtt !== null) setRttMs(rtt);
+      },
+      onSummary: (message) => {
+        setSummary(message);
+        setSummaryPending(false);
+        if (summaryTimerRef.current !== null) {
+          window.clearTimeout(summaryTimerRef.current);
+          summaryTimerRef.current = null;
+        }
+      },
       onError: (message) => {
         setConnectionState("error");
         setErrorMessage(`Session error: ${message}`);
+      },
+      onClose: () => {
+        // The server (or network) closed the socket while we were still
+        // live: release the mic, timers and audio instead of sitting on
+        // a dead session. A close WE initiated has already cleared
+        // sessionRef, so this is skipped for the Stop button.
+        if (sessionRef.current === session) {
+          stop();
+          setErrorMessage("The connection to the server was closed.");
+        }
       },
       onProtocolError: (raw) => {
         console.error(
