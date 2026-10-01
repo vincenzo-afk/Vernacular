@@ -159,6 +159,12 @@ class SegmentStart:
     # provider. Known before the first byte because the failover
     # decision is made before any audio is emitted for the segment.
     degraded: bool = False
+    segment_id: int = 0
+    key_moment: KeyMoment = field(default_factory=KeyMoment)
+    timings: SegmentTimings = field(default_factory=SegmentTimings)
+    speech_start_ms: int | None = None
+    speech_end_ms: int | None = None
+    context_turns: int = 0
 
 
 @dataclass
