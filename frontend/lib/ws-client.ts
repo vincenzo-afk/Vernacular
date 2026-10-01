@@ -89,10 +89,30 @@ export interface StyleTag {
   emphasis_words: string[];
   pause_pattern: string;
   confidence: number;
+  arousal: "low" | "medium" | "high";
+  acoustic: AcousticTag | null;
+  modality_conflict: boolean;
+  explanation: ExplanationTag | null;
+}
+
+export interface KeyMomentTag {
+  is_key: boolean;
+  score: number;
+  reasons: string[];
+}
+
+export interface TimingsTag {
+  queue_wait_ms: number;
+  style_wait_ms: number;
+  register_detection_ms: number | null;
+  translation_ms: number;
+  tts_first_byte_ms: number | null;
+  server_total_ms: number;
 }
 
 export interface SegmentMessage {
   type: "segment";
+  segment_id: number;
   source_text: string;
   translated_text: string;
   style: StyleTag;
@@ -101,6 +121,44 @@ export interface SegmentMessage {
    * surfaced in the UI -- degraded fidelity is never presented as
    * full quality (ARCHITECTURE.md §5). */
   degraded: boolean;
+  key_moment: KeyMomentTag;
+  timings: TimingsTag;
+  /** Position of the utterance on the mic stream's clock (ms since the
+   * first sample sent); null when no speech was detected. */
+  speech_start_ms: number | null;
+  speech_end_ms: number | null;
+  context_turns: number;
+}
+
+export interface CaptionMessage {
+  type: "caption";
+  text: string;
+  is_final: boolean;
+  segment_id: number | null;
+}
+
+export type NetworkTier = "good" | "fair" | "poor";
+
+export interface NetworkMessage {
+  type: "network";
+  tier: NetworkTier;
+  send_latency_ms: number | null;
+  client_rtt_ms: number | null;
+}
+
+export interface PongMessage {
+  type: "pong";
+  id: string | null;
+}
+
+export interface SummaryMessage {
+  type: "summary";
+  overview: string;
+  key_points: string[];
+  action_items: string[];
+  overall_tone: string;
+  turn_count: number;
+  generated_by: "llm" | "extractive";
 }
 
 export interface ErrorMessage {
