@@ -582,27 +582,60 @@ class SessionOrchestrator:
             # completion for no purpose.
             speculative_task.cancel()
 
-        return await self._run_register_detection(event)
+        return await self._run_register_detection(
+            event, context=context, acoustic=acoustic, sink=sink
+        )
 
     async def _run_register_detection(
-        self, event: TranscriptEvent
+        self,
+        event: TranscriptEvent,
+        context: str | None = None,
+        acoustic: AcousticFeatures | None = None,
+        sink: dict | None = None,
     ) -> StyleMetadata:
+        """
+        `sink`, when given, receives {"ms": duration} so the caller can
+        report THIS detection's own latency per segment (the aggregate
+        StageTiming list can't say which detection belonged to which
+        segment when several run speculatively).
+        """
         start = time.monotonic() * 1000
-        result = await self._register_detector.detect(event)
-        self._record("register_detection", start)
+        # Extra evidence is passed only when present, so a detector
+        # without these keywords (an older/duck-typed one) still works.
+        kwargs: dict = {}
+        if context:
+            kwargs["context"] = context
+        if acoustic is not None:
+            kwargs["acoustic"] = acoustic
+        result = await self._register_detector.detect(event, **kwargs)
+        duration = self._record("register_detection", start)
+        if sink is not None:
+            sink["ms"] = duration
         return result
 
     async def _process_segment(
-        self, segment_id: int, event: TranscriptEvent, style: StyleMetadata
+        self,
+        segment_id: int,
+        event: TranscriptEvent,
+        style: StyleMetadata,
+        *,
+        job: _FinalJob | None = None,
+        queue_wait_ms: float = 0.0,
+        style_wait_ms: float = 0.0,
     ) -> AsyncIterator[SegmentEvent]:
+        translation_context, context_turns = self._translation_context(
+            before=segment_id
+        )
         try:
             translate_start = time.monotonic() * 1000
+            kwargs = {"context": translation_context} if translation_context else {}
             translation = await self._translator.translate(
                 source_text=event.text,
                 source_style=style,
                 target_language=self._target_language,
+                **kwargs,
             )
-            self._record("translation", translate_start)
+            translation_ms = self._record("translation", translate_start)
         except Exception:
             logger.exception(
                 "orchestrator: segment %s translation failed, skipping "
