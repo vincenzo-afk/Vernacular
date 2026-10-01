@@ -9,5 +9,11 @@
     "incremental": false,
     "plugins": []
   },
-  "include": ["lib/pcm.ts", "tests/**/*.ts"]
+  "include": [
+    "lib/pcm.ts",
+    "lib/export.ts",
+    "lib/network.ts",
+    "lib/latency.ts",
+    "tests/**/*.ts"
+  ]
 }

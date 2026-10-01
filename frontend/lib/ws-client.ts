@@ -254,14 +254,50 @@ export class VernacularSession {
         this.options.onReady?.(parsed.audio);
       } else if (parsed.type === "segment") {
         this.options.onSegment?.(parsed);
+      } else if (parsed.type === "caption") {
+        this.options.onCaption?.(parsed);
+      } else if (parsed.type === "network") {
+        this.options.onNetwork?.(parsed);
+      } else if (parsed.type === "pong") {
+        this.options.onPong?.(parsed);
+      } else if (parsed.type === "summary") {
+        this.options.onSummary?.(parsed);
       } else {
         this.options.onError?.(parsed.message);
       }
     };
+
+    this.ws.onclose = () => this.options.onClose?.();
   }
 
   sendAudioChunk(chunk: ArrayBuffer): void {
-    this.ws?.send(chunk);
+    // Guard: the mic worklet can post a frame after the socket has
+    // closed (or before it opened); sending then throws.
+    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(chunk);
+  }
+
+  /** Bytes queued in the socket's send buffer but not yet on the wire --
+   * the client-side congestion signal used by lib/network.ts. */
+  get bufferedAmount(): number {
+    return this.ws?.bufferedAmount ?? 0;
+  }
+
+  private sendControl(message: object): void {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(message));
+    }
+  }
+
+  sendNetworkReport(tier: NetworkTier, rttMs: number | null): void {
+    this.sendControl({ type: "network", tier, rtt_ms: rttMs });
+  }
+
+  sendPing(id: string): void {
+    this.sendControl({ type: "ping", id });
+  }
+
+  requestSummary(language: "target" | "source" = "target"): void {
+    this.sendControl({ type: "summarize", language });
   }
 
   close(): void {
