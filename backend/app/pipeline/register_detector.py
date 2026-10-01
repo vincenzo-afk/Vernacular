@@ -135,11 +135,20 @@ FEW_SHOTS = [
             "emphasis_words": ["great"],
             "pause_pattern": "dramatic",
             "confidence": 0.81,
+            "explanation": {
+                "summary": "Positive wording, negative sentiment and a held 'great' signal irony.",
+                "cues": [
+                    {"kind": "lexical", "evidence": "'great' praising another meeting", "weight": 0.7},
+                    {"kind": "prosodic", "evidence": "long pause, 'great' held", "weight": 0.6},
+                ],
+                "context_used": False,
+            },
         },
     },
     {
         "transcript": "Watch out, the car's not stopping!",
         "prosody": "fast delivery, minimal pausing, high-intensity positive-arousal sentiment",
+        "acoustic": "arousal 0.91 (high); loudness +9 dB vs speaker baseline; pitch +30% vs baseline",
         "output": {
             "tone": "urgent",
             "pace": "rushed",
@@ -149,6 +158,62 @@ FEW_SHOTS = [
             "emphasis_words": ["watch", "not"],
             "pause_pattern": "clipped",
             "confidence": 0.93,
+            "explanation": {
+                "summary": "Warning words, rushed delivery and a much louder, higher voice.",
+                "cues": [
+                    {"kind": "lexical", "evidence": "'watch out' warning", "weight": 0.6},
+                    {"kind": "acoustic", "evidence": "+9 dB louder, pitch up 30%", "weight": 0.8},
+                ],
+                "context_used": False,
+            },
+        },
+    },
+    {
+        "context": '- "The build failed again." (annoyed/frustration)',
+        "transcript": "Oh, great.",
+        "prosody": "flat delivery; one word held",
+        "acoustic": "arousal 0.22 (low); loudness -6 dB vs speaker baseline; pitch movement 9 Hz",
+        "output": {
+            "tone": "sarcastic",
+            "pace": "slow",
+            "formality": "casual",
+            "emotion": "frustration",
+            "sarcasm_score": 0.9,
+            "emphasis_words": ["great"],
+            "pause_pattern": "dramatic",
+            "confidence": 0.86,
+            "explanation": {
+                "summary": "Praise right after a failure, said quietly and flat: sarcasm.",
+                "cues": [
+                    {"kind": "contextual", "evidence": "follows 'The build failed again.'", "weight": 0.9},
+                    {"kind": "incongruence", "evidence": "positive word, quiet flat voice", "weight": 0.7},
+                ],
+                "context_used": True,
+            },
+        },
+    },
+    {
+        "context": '- "We got the contract!" (excited/excitement)',
+        "transcript": "Oh, great.",
+        "prosody": "quick, rising delivery",
+        "acoustic": "arousal 0.80 (high); loudness +5 dB vs speaker baseline; pitch +22% vs baseline",
+        "output": {
+            "tone": "excited",
+            "pace": "fast",
+            "formality": "casual",
+            "emotion": "excitement",
+            "sarcasm_score": 0.04,
+            "emphasis_words": ["great"],
+            "pause_pattern": "natural",
+            "confidence": 0.84,
+            "explanation": {
+                "summary": "Same words, but after good news and in an animated voice: sincere.",
+                "cues": [
+                    {"kind": "contextual", "evidence": "follows 'We got the contract!'", "weight": 0.9},
+                    {"kind": "acoustic", "evidence": "louder, pitch up 22%", "weight": 0.6},
+                ],
+                "context_used": True,
+            },
         },
     },
     {
