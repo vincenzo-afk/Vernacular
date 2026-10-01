@@ -289,6 +289,12 @@ class SessionOrchestrator:
                     translated_text=current.translated_text,
                     style=current.style,
                     degraded=current.degraded,
+                    segment_id=current.segment_id,
+                    key_moment=current.key_moment,
+                    timings=current.timings,
+                    speech_start_ms=current.speech_start_ms,
+                    speech_end_ms=current.speech_end_ms,
+                    context_turns=current.context_turns,
                 )
                 current = None
 
